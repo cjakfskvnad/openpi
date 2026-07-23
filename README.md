@@ -290,6 +290,14 @@ uv run torchrun \
     --master_addr=<master_ip> \
     --master_port=<port> \
     scripts/train_pytorch.py <config_name> --exp_name=<run_name> --save_interval <interval>
+
+
+  CUDA_VISIBLE_DEVICES=1,2,3,4 PYTHONPATH=src torchrun \
+    --standalone --nnodes=1 --nproc_per_node=4 \
+    scripts/train_pytorch.py pi05_visuotactile_libero \
+    --exp_name libero_pi05_vt_headcam_gpu1234_bz32 \
+    --save_interval 1000 \
+    --overwrite
 ```
 
 ### Precision Settings

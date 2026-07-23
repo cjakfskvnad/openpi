@@ -748,9 +748,9 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
-        batch_size=256,
+        batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
+            warmup_steps=1_000,
             peak_lr=5e-5,
             decay_steps=1_000_000,
             decay_lr=5e-5,
@@ -758,7 +758,7 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        pytorch_weight_path="checkpoints/pytorch/pi05_base",
         num_train_steps=30_000,
     ),
     #
@@ -929,6 +929,129 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
+    ),
+    #
+    # PyTorch-only visuo-tactile pi0 training.
+    #
+    TrainConfig(
+        name="pi0_visuotactile",
+        model=pi0_config.Pi0VisuoTactileConfig(
+            action_horizon=50,
+            action_dim=32,
+            future_visuotactile_shape=(3, 16, 16),
+            future_visuotactile_latent_dim=32,
+        ),
+        data=SimpleDataConfig(
+            repo_id="your_hf_username/your_visuotactile_dataset",
+            data_transforms=lambda model: _transforms.Group(),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("actions", "future_visuotactile"),
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "image": {
+                                    "base_0_rgb": "observation.images.base_0_rgb",
+                                    "left_wrist_0_rgb": "observation.images.left_wrist_0_rgb",
+                                    "right_wrist_0_rgb": "observation.images.right_wrist_0_rgb",
+                                    "visuotactile_0_rgb": "observation.images.visuotactile_0_rgb",
+                                },
+                                "state": "observation.state",
+                                "actions": "actions",
+                                "future_visuotactile": "future_visuotactile",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+            ),
+        ),
+        pytorch_weight_path=None,
+        batch_size=32,
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_visuotactile_libero",
+        model=pi0_config.Pi0VisuoTactileConfig(
+            action_dim=32,
+            action_horizon=10,
+            future_visuotactile_shape=(224, 224, 3),
+            future_visuotactile_latent_dim=32,
+            future_visuotactile_decoder_width=512,
+            future_visuotactile_decoder_depth=4,
+            future_visuotactile_decoder_num_heads=8,
+            future_visuotactile_patch_size=16,
+        ),
+        data=SimpleDataConfig(
+            repo_id="physical-intelligence/libero",
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[libero_policy.LiberoVisuoTactileInputs(model_type=model.model_type)],
+                outputs=[libero_policy.LiberoOutputs()],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("actions", "image"),
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image": "image",
+                                "observation/wrist_image": "wrist_image",
+                                "observation/state": "state",
+                                "actions": "actions",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+            ),
+        ),
+        batch_size=32,
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_visuotactile_libero",
+        model=pi0_config.Pi0VisuoTactileConfig(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,
+            discrete_state_input=False,
+            future_visuotactile_shape=(224, 224, 3),
+            future_visuotactile_latent_dim=32,
+            future_visuotactile_decoder_width=512,
+            future_visuotactile_decoder_depth=4,
+            future_visuotactile_decoder_num_heads=8,
+            future_visuotactile_patch_size=16,
+        ),
+        data=SimpleDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(assets_dir="assets/pi05_libero"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[libero_policy.LiberoVisuoTactileInputs(model_type=model.model_type)],
+                outputs=[libero_policy.LiberoOutputs()],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("actions", "image"),
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image": "image",
+                                "observation/wrist_image": "wrist_image",
+                                "observation/state": "state",
+                                "actions": "actions",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+            ),
+        ),
+        pytorch_weight_path="checkpoints/pytorch/pi05_base",
+        batch_size=32,
+        num_train_steps=30_000,
     ),
     #
     # Debugging configs.

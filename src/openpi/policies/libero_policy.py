@@ -5,6 +5,7 @@ import numpy as np
 
 from openpi import transforms
 from openpi.models import model as _model
+from openpi.shared import image_tools
 
 
 def make_libero_example() -> dict:
@@ -24,6 +25,17 @@ def _parse_image(image) -> np.ndarray:
     if image.shape[0] == 3:
         image = einops.rearrange(image, "c h w -> h w c")
     return image
+
+
+def _parse_image_sequence(images) -> np.ndarray:
+    images = np.asarray(images)
+    if images.ndim == 3:
+        return _parse_image(images)[None]
+    if np.issubdtype(images.dtype, np.floating):
+        images = (255 * images).astype(np.uint8)
+    if images.shape[1] == 3:
+        images = einops.rearrange(images, "t c h w -> t h w c")
+    return images
 
 
 @dataclasses.dataclass(frozen=True)
@@ -52,7 +64,6 @@ class LiberoInputs(transforms.DataTransformFn):
         base_image = _parse_image(data["observation/image"])
         wrist_image = _parse_image(data["observation/wrist_image"])
 
-        # Create inputs dict. Do not change the keys in the dict below.
         inputs = {
             "state": data["observation/state"],
             "image": {
@@ -77,6 +88,44 @@ class LiberoInputs(transforms.DataTransformFn):
         # Pass the prompt (aka language instruction) to the model.
         # Keep this for your own dataset (but modify the key if the instruction is not
         # stored in "prompt"; the output dict always needs to have the key "prompt").
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class LiberoVisuoTactileInputs(transforms.DataTransformFn):
+    """Libero inputs that reuse the head camera as current and future visuo-tactile signal."""
+
+    model_type: _model.ModelType
+
+    def __call__(self, data: dict) -> dict:
+        head_images = _parse_image_sequence(data["observation/image"])
+        base_image = head_images[0]
+        wrist_image = _parse_image(data["observation/wrist_image"])
+        future_visuotactile = np.asarray(image_tools.resize_with_pad(head_images, 224, 224))
+        future_visuotactile = future_visuotactile.astype(np.float32) / 255.0 * 2.0 - 1.0
+
+        inputs = {
+            "state": data["observation/state"],
+            "image": {
+                "base_0_rgb": base_image,
+                "left_wrist_0_rgb": wrist_image,
+                "right_wrist_0_rgb": np.zeros_like(base_image),
+                "visuotactile_0_rgb": base_image,
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
+                "visuotactile_0_rgb": np.True_,
+            },
+            "future_visuotactile": future_visuotactile,
+        }
+
+        if "actions" in data:
+            inputs["actions"] = data["actions"]
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 

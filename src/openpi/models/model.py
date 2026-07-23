@@ -18,6 +18,7 @@ import safetensors
 import torch
 
 from openpi.models_pytorch import pi0_pytorch
+from openpi.models_pytorch import pi0_visuotactile_pytorch
 from openpi.shared import image_tools
 import openpi.shared.array_typing as at
 
@@ -106,12 +107,30 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Optional visuo-tactile fields used by PyTorch visuo-tactile pi0 variants.
+    visuotactile: at.PyTree[ArrayT] | None = None
+    visuotactile_mask: at.PyTree[ArrayT] | None = None
+    tactile: at.PyTree[ArrayT] | None = None
+    tactile_mask: at.PyTree[ArrayT] | None = None
+    current_visuotactile: at.PyTree[ArrayT] | None = None
+    current_visuotactile_mask: at.PyTree[ArrayT] | None = None
+    future_visuotactile: at.PyTree[ArrayT] | None = None
+    future_tactile: at.PyTree[ArrayT] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
+        image_masks = data.get("image_mask")
+        if image_masks is None:
+            image_masks = {}
+            for key, image in data["image"].items():
+                if hasattr(image, "device"):
+                    image_masks[key] = torch.ones(image.shape[0], dtype=torch.bool, device=image.device)
+                else:
+                    image_masks[key] = np.ones(image.shape[0], dtype=bool)
         # If images are uint8, convert them to [-1, 1] float32.
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
@@ -120,12 +139,20 @@ class Observation(Generic[ArrayT]):
                 data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
         return cls(
             images=data["image"],
-            image_masks=data["image_mask"],
+            image_masks=image_masks,
             state=data["state"],
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            visuotactile=data.get("visuotactile"),
+            visuotactile_mask=data.get("visuotactile_mask"),
+            tactile=data.get("tactile"),
+            tactile_mask=data.get("tactile_mask"),
+            current_visuotactile=data.get("current_visuotactile"),
+            current_visuotactile_mask=data.get("current_visuotactile_mask"),
+            future_visuotactile=data.get("future_visuotactile"),
+            future_tactile=data.get("future_tactile"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -242,8 +269,12 @@ class BaseModelConfig(abc.ABC):
 
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
-        model = pi0_pytorch.PI0Pytorch(config=train_config.model)
-        safetensors.torch.load_model(model, weight_path)
+        if train_config.model.__class__.__name__ == "Pi0VisuoTactileConfig":
+            model = pi0_visuotactile_pytorch.PI0VisuoTactilePytorch(config=train_config.model)
+            safetensors.torch.load_model(model, weight_path, strict=False)
+        else:
+            model = pi0_pytorch.PI0Pytorch(config=train_config.model)
+            safetensors.torch.load_model(model, weight_path)
         return model
 
     @abc.abstractmethod

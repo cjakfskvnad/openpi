@@ -56,7 +56,7 @@ class Pi0Config(_model.BaseModelConfig):
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0":
-        from openpi.models.pi0 import Pi0
+        from openpi.models.pi0 import Pi0  # noqa: PLC0415
 
         return Pi0(self, rngs=nnx.Rngs(rng))
 
@@ -115,3 +115,21 @@ class Pi0Config(_model.BaseModelConfig):
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0VisuoTactileConfig(Pi0Config):
+    """Pi0 PyTorch-only config for visuo-tactile current inputs and future prediction."""
+
+    visuotactile_keys: tuple[str, ...] = ("visuotactile_0_rgb", "tactile_0_rgb")
+    future_visuotactile_key: str = "future_visuotactile"
+    future_visuotactile_shape: tuple[int, ...] | None = None
+    future_visuotactile_latent_dim: int = 32
+    future_visuotactile_decoder_width: int = 512
+    future_visuotactile_decoder_depth: int = 4
+    future_visuotactile_decoder_num_heads: int = 8
+    future_visuotactile_patch_size: int = 16
+    future_visuotactile_encoder_chunk_size: int = 8
+    action_loss_weight: float = 1.0
+    future_flow_loss_weight: float = 1.0
+    future_visuotactile_loss_weight: float = 1.0

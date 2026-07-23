@@ -1,0 +1,5 @@
+assets: /home/user/kunlun/muze/openpi/third_party/libero/libero/libero/assets
+bddl_files: /home/user/kunlun/muze/openpi/third_party/libero/libero/libero/bddl_files
+benchmark_root: /home/user/kunlun/muze/openpi/third_party/libero/libero/libero
+datasets: /home/user/kunlun/muze/openpi/third_party/libero/libero/datasets
+init_states: /home/user/kunlun/muze/openpi/third_party/libero/libero/libero/init_files

@@ -27,6 +27,7 @@ import dataclasses
 import gc
 import logging
 import os
+import pickle
 import platform
 import shutil
 import time
@@ -42,6 +43,7 @@ import wandb
 
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
+import openpi.models_pytorch.pi0_visuotactile_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
@@ -94,6 +96,11 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
 def setup_ddp():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device)
+
     if use_ddp and not torch.distributed.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         torch.distributed.init_process_group(backend=backend, init_method="env://")
@@ -102,10 +109,6 @@ def setup_ddp():
         if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
             os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
 
-    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
-        torch.cuda.set_device(device)
     return use_ddp, local_rank, device
 
 
@@ -146,6 +149,34 @@ def get_model_parameters(model):
     )
 
 
+def _make_checkpoint_metadata_value(value):
+    """Convert config values to a form that torch.save can pickle."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _make_checkpoint_metadata_value(getattr(value, field.name))
+            for field in dataclasses.fields(value)
+        }
+    if isinstance(value, dict):
+        return {
+            _make_checkpoint_metadata_value(key): _make_checkpoint_metadata_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_make_checkpoint_metadata_value(item) for item in value)
+    if isinstance(value, list):
+        return [_make_checkpoint_metadata_value(item) for item in value]
+    if isinstance(value, os.PathLike):
+        return os.fspath(value)
+    if callable(value):
+        return repr(value)
+
+    try:
+        pickle.dumps(value)
+    except (pickle.PickleError, TypeError, AttributeError):
+        return repr(value)
+    return value
+
+
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
@@ -172,7 +203,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         # Save training metadata (avoid saving full config to prevent JAX/Flax compatibility issues)
         metadata = {
             "global_step": global_step,
-            "config": dataclasses.asdict(config),
+            "config": _make_checkpoint_metadata_value(config),
             "timestamp": time.time(),
         }
         torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
@@ -328,7 +359,7 @@ def train_loop(config: _config.TrainConfig):
                 raise FileNotFoundError(f"No valid checkpoints found in {exp_checkpoint_dir} for resume")
         else:
             raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
-    elif config.overwrite and config.checkpoint_dir.exists():
+    elif is_main and config.overwrite and config.checkpoint_dir.exists():
         shutil.rmtree(config.checkpoint_dir)
         logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
 
@@ -336,11 +367,16 @@ def train_loop(config: _config.TrainConfig):
     if not resuming:
         # For new runs, create experiment-specific checkpoint directory
         exp_checkpoint_dir = config.checkpoint_dir
-        exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
+        if is_main:
+            exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
     else:
         # For resume, checkpoint_dir is already set to the experiment directory
-        logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
+        if is_main:
+            logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
+
+    if use_ddp:
+        dist.barrier()
 
     # Initialize wandb (only on main process)
     if is_main:
@@ -406,7 +442,10 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    if isinstance(model_cfg, openpi.models.pi0_config.Pi0VisuoTactileConfig):
+        model = openpi.models_pytorch.pi0_visuotactile_pytorch.PI0VisuoTactilePytorch(model_cfg).to(device)
+    else:
+        model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -444,7 +483,9 @@ def train_loop(config: _config.TrainConfig):
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
         safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
+            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model),
+            model_path,
+            strict=not isinstance(model_cfg, openpi.models.pi0_config.Pi0VisuoTactileConfig),
         )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
@@ -526,7 +567,12 @@ def train_loop(config: _config.TrainConfig):
                 pg["lr"] = lr_schedule(global_step)
 
             # Forward pass
-            losses = model(observation, actions)
+            if isinstance(model_cfg, openpi.models.pi0_config.Pi0VisuoTactileConfig):
+                loss_outputs = model(observation, actions, return_dict=True)
+                losses = loss_outputs["loss"]
+            else:
+                loss_outputs = {}
+                losses = model(observation, actions)
             # Ensure losses is a tensor and handle different return types
             if isinstance(losses, list | tuple):
                 losses = torch.stack(losses)
@@ -557,13 +603,15 @@ def train_loop(config: _config.TrainConfig):
 
             # Collect stats
             if is_main:
-                infos.append(
-                    {
-                        "loss": loss.item(),
-                        "learning_rate": optim.param_groups[0]["lr"],
-                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                    }
-                )
+                step_info = {
+                    "loss": loss.item(),
+                    "learning_rate": optim.param_groups[0]["lr"],
+                    "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                }
+                for loss_name in ("action_loss", "future_flow_loss", "future_recon_loss"):
+                    if loss_name in loss_outputs:
+                        step_info[loss_name] = loss_outputs[loss_name].detach().mean().item()
+                infos.append(step_info)
 
             if is_main and (global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
@@ -571,6 +619,12 @@ def train_loop(config: _config.TrainConfig):
                 # Average stats over log interval
                 avg_loss = sum(info["loss"] for info in infos) / len(infos)
                 avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
+                avg_extra_losses = {
+                    loss_name: sum(info[loss_name] for info in infos if loss_name in info)
+                    / max(1, sum(1 for info in infos if loss_name in info))
+                    for loss_name in ("action_loss", "future_flow_loss", "future_recon_loss")
+                    if any(loss_name in info for info in infos)
+                }
 
                 avg_grad_norm = None
                 if any("grad_norm" in info for info in infos):
@@ -579,11 +633,14 @@ def train_loop(config: _config.TrainConfig):
                     ]
                     if len(vals) > 0:
                         avg_grad_norm = sum(vals) / len(vals)
-                logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
-                    if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
-                )
+                extra_loss_str = " ".join(f"{key}={value:.4f}" for key, value in avg_extra_losses.items())
+                log_msg = f"step={global_step} loss={avg_loss:.4f}"
+                if extra_loss_str:
+                    log_msg = f"{log_msg} {extra_loss_str}"
+                log_msg = f"{log_msg} lr={avg_lr:.2e}"
+                if avg_grad_norm is not None:
+                    log_msg = f"{log_msg} grad_norm={avg_grad_norm:.2f}"
+                logging.info(f"{log_msg} time={elapsed:.1f}s")
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
@@ -593,6 +650,7 @@ def train_loop(config: _config.TrainConfig):
                         "step": global_step,
                         "time_per_step": elapsed / config.log_interval,
                     }
+                    log_payload.update(avg_extra_losses)
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
                     wandb.log(log_payload, step=global_step)
