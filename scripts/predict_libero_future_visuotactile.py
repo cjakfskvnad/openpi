@@ -25,7 +25,7 @@ LIBERO_ENV_RESOLUTION = 256
 @dataclasses.dataclass
 class Args:
     checkpoint_dir: pathlib.Path = pathlib.Path(
-        "checkpoints/pi05_visuotactile_libero/libero_pi05_vt_headcam_gpu1234_bz32/4000"
+        "checkpoints/pi05_visuotactile_libero/libero_pi05_vt_spatial_gpu1234_bz32/30000"
     )
     config_name: str = "pi05_visuotactile_libero"
     task_suite_name: str = "libero_spatial"
@@ -36,7 +36,7 @@ class Args:
     sample_steps: int = 10
     seed: int = 7
     device: str | None = None
-    out_dir: pathlib.Path = pathlib.Path("data/libero/future_visuotactile/pi05_vt_4000")
+    out_dir: pathlib.Path = pathlib.Path("data/libero/future_visuotactile/pi05_vt_spatial_30000")
 
 
 def main(args: Args) -> None:

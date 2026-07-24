@@ -292,12 +292,47 @@ uv run torchrun \
     scripts/train_pytorch.py <config_name> --exp_name=<run_name> --save_interval <interval>
 
 
+  # 1. Train the spatial image autoencoder independently. This process does
+  # not construct or load Pi0/PaliGemma.
+  CUDA_VISIBLE_DEVICES=1,2,3,4 PYTHONPATH=src torchrun \
+    --standalone --nnodes=1 --nproc_per_node=4 \
+    scripts/train_future_visuotactile_autoencoder.py \
+    --exp-name libero_headcam_spatial_ae \
+    --batch-size 256 \
+    --num-train-steps 30000 \
+    --save-interval 1000 \
+    --overwrite
+
+  # 2. Load the latest standalone AE checkpoint, freeze its encoder, and train
+  # action/future flow matching.
   CUDA_VISIBLE_DEVICES=1,2,3,4 PYTHONPATH=src torchrun \
     --standalone --nnodes=1 --nproc_per_node=4 \
     scripts/train_pytorch.py pi05_visuotactile_libero \
-    --exp_name libero_pi05_vt_headcam_gpu1234_bz32 \
+    --exp_name libero_pi05_vt_spatial_gpu1234_bz32 \
+    --pytorch-autoencoder-weight-path checkpoints/future_visuotactile_autoencoder/libero_headcam_spatial_ae \
     --save_interval 1000 \
     --overwrite
+
+  # Continue the same staged run without deleting its checkpoints:
+  CUDA_VISIBLE_DEVICES=1,2,3,4 PYTHONPATH=src torchrun \
+    --standalone --nnodes=1 --nproc_per_node=4 \
+    scripts/train_pytorch.py pi05_visuotactile_libero \
+    --exp_name libero_pi05_vt_spatial_gpu1234_bz32 \
+    --pytorch-autoencoder-weight-path checkpoints/future_visuotactile_autoencoder/libero_headcam_spatial_ae \
+    --save_interval 1000 \
+    --resume
+
+  # Alternative policy with a dedicated tactile Gemma expert. It loads the
+  # configured single-frame AE checkpoint at step 7000 automatically.
+  CUDA_VISIBLE_DEVICES=1,2,3,4 PYTHONPATH=src torchrun \
+    --standalone --nnodes=1 --nproc_per_node=4 \
+    scripts/train_pytorch.py pi05_expert_visuotactile_libero \
+    --exp-name libero_pi05_tactile_expert_bz32 \
+    --save-interval 1000 \
+    --overwrite
+
+  # Add --no-pytorch-gradient-checkpointing to any train_pytorch.py command
+  # when higher speed is preferred and GPU memory is sufficient.
 ```
 
 ### Precision Settings

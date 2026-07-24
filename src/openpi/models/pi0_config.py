@@ -56,7 +56,7 @@ class Pi0Config(_model.BaseModelConfig):
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0":
-        from openpi.models.pi0 import Pi0  # noqa: PLC0415
+        from openpi.models.pi0 import Pi0
 
         return Pi0(self, rngs=nnx.Rngs(rng))
 
@@ -121,15 +121,42 @@ class Pi0Config(_model.BaseModelConfig):
 class Pi0VisuoTactileConfig(Pi0Config):
     """Pi0 PyTorch-only config for visuo-tactile current inputs and future prediction."""
 
+    # Use a third Gemma stream dedicated to future latent prediction instead
+    # of concatenating future latents into the action expert.
+    use_separate_visuotactile_expert: bool = False
+    visuotactile_expert_variant: _gemma.Variant = "gemma_300m"
     visuotactile_keys: tuple[str, ...] = ("visuotactile_0_rgb", "tactile_0_rgb")
     future_visuotactile_key: str = "future_visuotactile"
     future_visuotactile_shape: tuple[int, ...] | None = None
-    future_visuotactile_latent_dim: int = 32
+    # Number of channels in the spatial latent grid. The flattened flow state
+    # has latent_dim * grid_height * grid_width values per future frame.
+    future_visuotactile_latent_dim: int = 16
+    future_visuotactile_latent_grid_size: tuple[int, int] = (14, 14)
+    future_visuotactile_encoder_width: int = 64
     future_visuotactile_decoder_width: int = 512
-    future_visuotactile_decoder_depth: int = 4
+    future_visuotactile_decoder_depth: int = 2
     future_visuotactile_decoder_num_heads: int = 8
     future_visuotactile_patch_size: int = 16
     future_visuotactile_encoder_chunk_size: int = 8
     action_loss_weight: float = 1.0
     future_flow_loss_weight: float = 1.0
     future_visuotactile_loss_weight: float = 1.0
+    future_autoencoder_loss_weight: float = 1.0
+    # After future_joint_finetune_start_step, keep action loss at full weight
+    # and reduce auxiliary future-prediction objectives.
+    future_joint_flow_loss_weight: float = 0.05
+    future_joint_visuotactile_loss_weight: float = 0.1
+    future_joint_autoencoder_loss_weight: float = 0.05
+    future_mse_loss_weight: float = 0.1
+    future_charbonnier_loss_weight: float = 1.0
+    future_ssim_loss_weight: float = 0.2
+    future_gradient_loss_weight: float = 0.1
+    future_pyramid_loss_weight: float = 0.1
+    future_temporal_loss_weight: float = 0.2
+
+    # Staged PyTorch training: autoencoder only, then frozen-VAE flow
+    # matching, then low-LR joint fine-tuning.
+    future_autoencoder_pretrain_steps: int = 5_000
+    future_joint_finetune_start_step: int = 5_000
+    future_head_lr_multiplier: float = 4.0
+    future_backbone_lr_multiplier: float = 0.25

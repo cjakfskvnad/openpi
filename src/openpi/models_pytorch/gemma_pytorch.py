@@ -93,7 +93,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         position_ids: torch.LongTensor | None = None,
         past_key_values: list[torch.FloatTensor] | None = None,
         inputs_embeds: list[torch.FloatTensor] | None = None,
-        use_cache: bool | None = None,
+        use_cache: bool | None = None,  # noqa: FBT001
         adarms_cond: list[torch.Tensor] | None = None,
     ):
         if adarms_cond is None:
@@ -278,3 +278,266 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_past_key_values = None
 
         return [prefix_output, suffix_output], prefix_past_key_values
+
+
+class PaliGemmaWithActionAndVisuoTactileExpertsModel(PaliGemmaWithExpertModel):
+    """PaliGemma with independent action and future visuo-tactile experts.
+
+    The three token streams use their own projections, MLPs, and normalization
+    parameters while sharing one attention operation at every transformer
+    layer. Consequently, the expert widths may differ, but their attention
+    depth, head count, key/value head count, and head dimension must match.
+
+    Multi-stream forward passes intentionally do not use a KV cache. A cache
+    produced by a prefix-only call contains PaliGemma-projected keys and values,
+    but updating that cache from two independent suffix experts would mutate it
+    during every denoising step. Callers should run all three streams together
+    when predicting actions and future visuo-tactile latents.
+    """
+
+    def __init__(
+        self,
+        vlm_config,
+        action_expert_config,
+        visuotactile_expert_config,
+        use_adarms=None,
+        precision: Literal["bfloat16", "float32"] = "bfloat16",
+    ):
+        if use_adarms is None:
+            use_adarms = [False, False, False]
+        if len(use_adarms) != 3:
+            raise ValueError(f"use_adarms must contain three entries, got {len(use_adarms)}.")
+
+        super().__init__(
+            vlm_config,
+            action_expert_config,
+            use_adarms=use_adarms[:2],
+            precision=precision,
+        )
+
+        self._validate_expert_attention_configs(
+            vlm_config,
+            action_expert_config,
+            visuotactile_expert_config,
+        )
+        visuotactile_expert_config_hf = CONFIG_MAPPING["gemma"](
+            head_dim=visuotactile_expert_config.head_dim,
+            hidden_size=visuotactile_expert_config.width,
+            intermediate_size=visuotactile_expert_config.mlp_dim,
+            num_attention_heads=visuotactile_expert_config.num_heads,
+            num_hidden_layers=visuotactile_expert_config.depth,
+            num_key_value_heads=visuotactile_expert_config.num_kv_heads,
+            vocab_size=257152,
+            hidden_activation="gelu_pytorch_tanh",
+            torch_dtype="float32",
+            use_adarms=use_adarms[2],
+            adarms_cond_dim=visuotactile_expert_config.width if use_adarms[2] else None,
+        )
+        self.gemma_visuotactile_expert = GemmaForCausalLM(config=visuotactile_expert_config_hf)
+        self.gemma_visuotactile_expert.model.embed_tokens = None
+
+        # The parent applies precision before this expert exists, so apply it
+        # once more after registering the new module.
+        self.to_bfloat16_for_selected_params(precision)
+
+    @staticmethod
+    def _validate_expert_attention_configs(*configs):
+        shared_fields = ("depth", "num_heads", "num_kv_heads", "head_dim")
+        for field in shared_fields:
+            values = [getattr(config, field) for config in configs]
+            if any(value != values[0] for value in values[1:]):
+                raise ValueError(f"All experts must share {field}; got {values}.")
+
+    def _models(self):
+        return [
+            self.paligemma.language_model,
+            self.gemma_expert.model,
+            self.gemma_visuotactile_expert.model,
+        ]
+
+    def _forward_single_stream(
+        self,
+        stream_index,
+        hidden_states,
+        attention_mask,
+        position_ids,
+        past_key_values,
+        use_cache,
+        adarms_cond,
+    ):
+        output = self._models()[stream_index].forward(
+            inputs_embeds=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            adarms_cond=adarms_cond,
+        )
+        outputs = [None, None, None]
+        outputs[stream_index] = output.last_hidden_state
+        prefix_past_key_values = output.past_key_values if stream_index == 0 else None
+        return outputs, prefix_past_key_values
+
+    def _compute_joint_layer(
+        self,
+        layer_idx,
+        hidden_streams,
+        attention_mask,
+        position_ids,
+        adarms_cond,
+    ):
+        models = self._models()
+        active_indices = [index for index, hidden in enumerate(hidden_streams) if hidden is not None]
+
+        query_states = []
+        key_states = []
+        value_states = []
+        gates = {}
+        for index in active_indices:
+            layer = models[index].layers[layer_idx]
+            normalized, gate = layer.input_layernorm(hidden_streams[index], cond=adarms_cond[index])
+            gates[index] = gate
+
+            input_shape = normalized.shape[:-1]
+            hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+            query_states.append(layer.self_attn.q_proj(normalized).view(hidden_shape).transpose(1, 2))
+            key_states.append(layer.self_attn.k_proj(normalized).view(hidden_shape).transpose(1, 2))
+            value_states.append(layer.self_attn.v_proj(normalized).view(hidden_shape).transpose(1, 2))
+
+        query_states = torch.cat(query_states, dim=2)
+        key_states = torch.cat(key_states, dim=2)
+        value_states = torch.cat(value_states, dim=2)
+
+        dummy_tensor = torch.zeros(
+            query_states.shape[0],
+            query_states.shape[2],
+            query_states.shape[-1],
+            device=query_states.device,
+            dtype=query_states.dtype,
+        )
+        cos, sin = self.paligemma.language_model.rotary_emb(dummy_tensor, position_ids)
+        query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
+            query_states,
+            key_states,
+            cos,
+            sin,
+            unsqueeze_dim=1,
+        )
+
+        reference_attention = self.paligemma.language_model.layers[layer_idx].self_attn
+        attention_output, _ = modeling_gemma.eager_attention_forward(
+            reference_attention,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            reference_attention.scaling,
+            dropout=0.0 if not self.training else reference_attention.attention_dropout,
+        )
+
+        outputs = [None, None, None]
+        start_pos = 0
+        for index in active_indices:
+            hidden_states = hidden_streams[index]
+            layer = models[index].layers[layer_idx]
+            end_pos = start_pos + hidden_states.shape[1]
+            stream_attention = attention_output[:, start_pos:end_pos].reshape(
+                hidden_states.shape[0],
+                hidden_states.shape[1],
+                layer.self_attn.q_proj.out_features,
+            )
+            stream_attention = stream_attention.to(dtype=layer.self_attn.o_proj.weight.dtype)
+            projected_attention = layer.self_attn.o_proj(stream_attention)
+
+            output = modeling_gemma._gated_residual(  # noqa: SLF001
+                hidden_states,
+                projected_attention,
+                gates[index],
+            )
+            first_residual = output
+            output, gate = layer.post_attention_layernorm(output, cond=adarms_cond[index])
+            output = output.to(dtype=layer.mlp.up_proj.weight.dtype)
+            output = layer.mlp(output)
+            outputs[index] = modeling_gemma._gated_residual(first_residual, output, gate)  # noqa: SLF001
+            start_pos = end_pos
+
+        return outputs
+
+    def forward(
+        self,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: list[torch.FloatTensor] | None = None,
+        inputs_embeds: list[torch.FloatTensor] | None = None,
+        use_cache: bool | None = None,  # noqa: FBT001
+        adarms_cond: list[torch.Tensor] | None = None,
+    ):
+        if inputs_embeds is None or len(inputs_embeds) != 3:
+            raise ValueError("inputs_embeds must be [prefix, action, visuotactile].")
+        if adarms_cond is None:
+            adarms_cond = [None, None, None]
+        if len(adarms_cond) != 3:
+            raise ValueError("adarms_cond must contain prefix, action, and visuotactile entries.")
+
+        active_indices = [index for index, hidden in enumerate(inputs_embeds) if hidden is not None]
+        if not active_indices:
+            raise ValueError("At least one input stream must be provided.")
+        if len(active_indices) == 1:
+            index = active_indices[0]
+            return self._forward_single_stream(
+                index,
+                inputs_embeds[index],
+                attention_mask,
+                position_ids,
+                past_key_values,
+                use_cache,
+                adarms_cond[index],
+            )
+        if past_key_values is not None or use_cache:
+            raise ValueError("KV caching is only supported for single-stream forward passes.")
+
+        models = self._models()
+        use_gradient_checkpointing = self.training and any(
+            getattr(models[index], "gradient_checkpointing", False) for index in active_indices
+        )
+
+        hidden_streams = list(inputs_embeds)
+        for layer_idx in range(self.paligemma.config.text_config.num_hidden_layers):
+            if use_gradient_checkpointing:
+
+                def checkpointed_layer(*active_hidden_states, current_layer_idx=layer_idx):
+                    checkpoint_inputs = [None, None, None]
+                    for index, hidden in zip(active_indices, active_hidden_states, strict=True):
+                        checkpoint_inputs[index] = hidden
+                    checkpoint_outputs = self._compute_joint_layer(
+                        current_layer_idx,
+                        checkpoint_inputs,
+                        attention_mask,
+                        position_ids,
+                        adarms_cond,
+                    )
+                    return tuple(checkpoint_outputs[index] for index in active_indices)
+
+                active_outputs = torch.utils.checkpoint.checkpoint(
+                    checkpointed_layer,
+                    *(hidden_streams[index] for index in active_indices),
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+                if len(active_indices) == 1:
+                    active_outputs = (active_outputs,)
+                for index, output in zip(active_indices, active_outputs, strict=True):
+                    hidden_streams[index] = output
+            else:
+                hidden_streams = self._compute_joint_layer(
+                    layer_idx,
+                    hidden_streams,
+                    attention_mask,
+                    position_ids,
+                    adarms_cond,
+                )
+
+        outputs = [None, None, None]
+        for index in active_indices:
+            outputs[index], _ = models[index].norm(hidden_streams[index], cond=adarms_cond[index])
+        return outputs, None

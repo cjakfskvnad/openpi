@@ -34,6 +34,7 @@ class Args:
     task_suite_name: str = (
         "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
+    task_id: int | None = None  # If set, evaluate only this task in the suite.
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
 
@@ -75,7 +76,10 @@ def eval_libero(args: Args) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    if args.task_id is not None and not 0 <= args.task_id < num_tasks_in_suite:
+        raise ValueError(f"Task id {args.task_id} is outside [0, {num_tasks_in_suite}).")
+    task_ids = range(num_tasks_in_suite) if args.task_id is None else [args.task_id]
+    for task_id in tqdm.tqdm(task_ids):
         # Get task
         task = task_suite.get_task(task_id)
 

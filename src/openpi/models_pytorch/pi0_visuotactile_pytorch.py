@@ -39,28 +39,43 @@ def _as_tuple(value: Any) -> tuple[Any, ...]:
     return (value,)
 
 
-class FutureVisuoTactileVisionAutoencoder(nn.Module):
-    """Vision-style future visuo-tactile encoder and patch decoder.
+class ConvResidualBlock(nn.Module):
+    """Small residual block used by the spatial future-image decoder."""
 
-    The encoder reuses the PaliGemma/SigLIP image encoder. Each future tactile
-    frame is encoded as image tokens, mean-pooled, then projected to one latent
-    token per action timestep. The decoder is a ViT-style patch decoder with
-    learned patch queries conditioned on the denoised future latent.
+    def __init__(self, channels: int):
+        super().__init__()
+        num_groups = min(32, channels)
+        while channels % num_groups != 0:
+            num_groups -= 1
+        self.norm1 = nn.GroupNorm(num_groups, channels)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(num_groups, channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        residual = x
+        x = self.conv1(F.silu(self.norm1(x)))
+        x = self.conv2(F.silu(self.norm2(x)))
+        return x + residual
+
+
+class FutureVisuoTactileVisionAutoencoder(nn.Module):
+    """Self-contained convolutional autoencoder for future images.
+
+    This module intentionally owns both its encoder and decoder. It has no
+    dependency on Pi0, PaliGemma, or SigLIP, so it can be pretrained directly on
+    image sequences and later loaded as a frozen latent codec by the policy.
     """
 
     def __init__(
         self,
         *,
-        image_encoder,
-        encoder_width: int,
         latent_dim: int,
         future_shape: tuple[int, ...],
+        encoder_width: int,
         decoder_width: int,
         decoder_depth: int,
-        decoder_num_heads: int,
-        patch_size: int,
-        encoder_chunk_size: int,
-        encoder_image_size: int = 224,
+        latent_grid_size: tuple[int, int] | None = None,
     ):
         super().__init__()
         if len(future_shape) != 3:
@@ -80,38 +95,78 @@ class FutureVisuoTactileVisionAutoencoder(nn.Module):
                 f"got {future_shape}."
             )
 
-        self.image_encoder = image_encoder
-        self.latent_dim = latent_dim
+        self.latent_channels = latent_dim
         self.future_shape = future_shape
         self.out_channels = channels
         self.out_height = height
         self.out_width = width
-        self.patch_size = patch_size
-        self.encoder_chunk_size = encoder_chunk_size
-        self.encoder_image_size = encoder_image_size
-        self.gradient_checkpointing_enabled = False
 
-        self.encoder_proj = nn.Linear(encoder_width, latent_dim)
-        self.latent_to_decoder = nn.Linear(latent_dim, decoder_width)
+        if latent_grid_size is None:
+            latent_grid_size = (14, 14)
+        self.latent_grid_h, self.latent_grid_w = latent_grid_size
+        if self.latent_grid_h <= 0 or self.latent_grid_w <= 0:
+            raise ValueError(f"latent_grid_size must be positive, got {latent_grid_size}.")
+        height_ratio = height / self.latent_grid_h
+        width_ratio = width / self.latent_grid_w
+        if height_ratio != width_ratio or not height_ratio.is_integer():
+            raise ValueError(
+                "Image size must be an equal integer multiple of latent_grid_size, "
+                f"got image {(height, width)} and grid {latent_grid_size}."
+            )
+        num_downsamples = int(math.log2(int(height_ratio)))
+        if 2**num_downsamples != int(height_ratio):
+            raise ValueError(
+                "Image-to-latent ratio must be a power of two, "
+                f"got image {(height, width)} and grid {latent_grid_size}."
+            )
+        self.flat_latent_dim = self.latent_channels * self.latent_grid_h * self.latent_grid_w
 
-        self.patch_grid_h = math.ceil(height / patch_size)
-        self.patch_grid_w = math.ceil(width / patch_size)
-        self.num_patches = self.patch_grid_h * self.patch_grid_w
-        self.patch_queries = nn.Parameter(torch.zeros(1, self.num_patches, decoder_width))
-        self.patch_pos_embedding = nn.Parameter(torch.zeros(1, self.num_patches, decoder_width))
-
-        decoder_layer = nn.TransformerEncoderLayer(
-            d_model=decoder_width,
-            nhead=decoder_num_heads,
-            dim_feedforward=4 * decoder_width,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        encoder_stages = []
+        current_width = max(32, encoder_width)
+        self.encoder_in = nn.Conv2d(channels, current_width, kernel_size=3, padding=1)
+        for _ in range(num_downsamples):
+            next_width = min(max(64, decoder_width), current_width * 2)
+            encoder_stages.append(
+                nn.Sequential(
+                    ConvResidualBlock(current_width),
+                    nn.Conv2d(current_width, next_width, kernel_size=4, stride=2, padding=1),
+                )
+            )
+            current_width = next_width
+        self.encoder_stages = nn.ModuleList(encoder_stages)
+        self.encoder_out = nn.Sequential(
+            ConvResidualBlock(current_width),
+            nn.GroupNorm(min(32, current_width), current_width),
+            nn.SiLU(),
+            nn.Conv2d(current_width, self.latent_channels, kernel_size=3, padding=1),
         )
-        self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=decoder_depth)
-        self.patch_out = nn.Linear(decoder_width, channels * patch_size * patch_size)
-        nn.init.normal_(self.patch_queries, std=0.02)
-        nn.init.normal_(self.patch_pos_embedding, std=0.02)
+
+        bottleneck_width = max(64, decoder_width)
+        self.decoder_in = nn.Conv2d(self.latent_channels, bottleneck_width, kernel_size=3, padding=1)
+        self.decoder_bottleneck = nn.Sequential(
+            *(ConvResidualBlock(bottleneck_width) for _ in range(max(1, decoder_depth)))
+        )
+
+        decoder_stages = []
+        current_width = bottleneck_width
+        for _ in range(num_downsamples):
+            next_width = max(32, current_width // 2)
+            decoder_stages.append(
+                nn.ModuleDict(
+                    {
+                        "residual": ConvResidualBlock(current_width),
+                        "projection": nn.Conv2d(current_width, next_width, kernel_size=3, padding=1),
+                    }
+                )
+            )
+            current_width = next_width
+        self.decoder_stages = nn.ModuleList(decoder_stages)
+        self.decoder_out = nn.Sequential(
+            ConvResidualBlock(current_width),
+            nn.GroupNorm(min(32, current_width), current_width),
+            nn.SiLU(),
+            nn.Conv2d(current_width, channels, kernel_size=3, padding=1),
+        )
 
     def _future_to_image_batch(self, future_visuotactile: Tensor) -> tuple[Tensor, int, int]:
         if future_visuotactile.ndim != 5:
@@ -126,62 +181,167 @@ class FutureVisuoTactileVisionAutoencoder(nn.Module):
             images = future_visuotactile.permute(0, 1, 4, 2, 3).reshape(
                 batch_size * horizon, future_visuotactile.shape[-1], *future_visuotactile.shape[2:4]
             )
-        if images.shape[1] == 1:
-            images = images.expand(-1, 3, -1, -1)
         return images, batch_size, horizon
 
     def encode(self, future_visuotactile: Tensor) -> Tensor:
         images, batch_size, horizon = self._future_to_image_batch(future_visuotactile)
-        if images.shape[-2:] != (self.encoder_image_size, self.encoder_image_size):
-            images = F.interpolate(
-                images, size=(self.encoder_image_size, self.encoder_image_size), mode="bilinear", align_corners=False
+        if images.shape[-2:] != (self.out_height, self.out_width):
+            images = F.interpolate(images, size=(self.out_height, self.out_width), mode="bilinear", align_corners=False)
+        x = self.encoder_in(images.to(dtype=torch.float32))
+        for stage in self.encoder_stages:
+            x = stage(x)
+        latents = self.encoder_out(x)
+        if latents.shape[-2:] != (self.latent_grid_h, self.latent_grid_w):
+            raise RuntimeError(
+                f"Encoder produced grid {tuple(latents.shape[-2:])}, expected "
+                f"{(self.latent_grid_h, self.latent_grid_w)}."
             )
+        latents = latents.flatten(1)
+        # A fixed per-frame normalization gives flow matching a stable target
+        # scale and prevents the encoder from winning by shrinking its codes.
+        latents = F.layer_norm(latents, (self.flat_latent_dim,))
+        return latents.reshape(batch_size, horizon, self.flat_latent_dim)
 
-        pooled_chunks = []
-        for image_chunk in torch.split(images, self.encoder_chunk_size, dim=0):
-            if self.gradient_checkpointing_enabled and self.training:
-                image_tokens = torch.utils.checkpoint.checkpoint(
-                    self.image_encoder,
-                    image_chunk,
-                    use_reentrant=False,
-                    preserve_rng_state=False,
-                )
-            else:
-                image_tokens = self.image_encoder(image_chunk)
-            pooled_chunks.append(image_tokens.mean(dim=1).to(dtype=torch.float32))
-
-        pooled = torch.cat(pooled_chunks, dim=0)
-        latents = self.encoder_proj(pooled)
-        return latents.reshape(batch_size, horizon, self.latent_dim)
+    def forward(self, future_visuotactile: Tensor) -> tuple[Tensor, Tensor]:
+        latents = self.encode(future_visuotactile)
+        return self.decode(latents), latents
 
     def decode(self, future_latents: Tensor) -> Tensor:
         batch_size, horizon = future_latents.shape[:2]
-        latents = future_latents.reshape(batch_size * horizon, self.latent_dim)
-        cond = self.latent_to_decoder(latents)[:, None, :]
-        tokens = self.patch_queries + self.patch_pos_embedding + cond
-        tokens = self.decoder(tokens)
-        patches = self.patch_out(tokens)
-
-        patches = patches.reshape(
+        if future_latents.shape[-1] != self.flat_latent_dim:
+            raise ValueError(f"Expected future latent dim {self.flat_latent_dim}, got {future_latents.shape[-1]}.")
+        x = future_latents.reshape(
             batch_size * horizon,
-            self.patch_grid_h,
-            self.patch_grid_w,
-            self.out_channels,
-            self.patch_size,
-            self.patch_size,
+            self.latent_channels,
+            self.latent_grid_h,
+            self.latent_grid_w,
         )
-        image = patches.permute(0, 3, 1, 4, 2, 5).reshape(
-            batch_size * horizon,
-            self.out_channels,
-            self.patch_grid_h * self.patch_size,
-            self.patch_grid_w * self.patch_size,
-        )
-        image = image[:, :, : self.out_height, : self.out_width]
+        x = self.decoder_bottleneck(self.decoder_in(x))
+        for stage in self.decoder_stages:
+            x = stage["residual"](x)
+            next_height = min(self.out_height, x.shape[-2] * 2)
+            next_width = min(self.out_width, x.shape[-1] * 2)
+            x = F.interpolate(x, size=(next_height, next_width), mode="bilinear", align_corners=False)
+            x = stage["projection"](x)
+        if x.shape[-2:] != (self.out_height, self.out_width):
+            x = F.interpolate(x, size=(self.out_height, self.out_width), mode="bilinear", align_corners=False)
+        image = torch.tanh(self.decoder_out(x))
         if self.channels_first:
             return image.reshape(batch_size, horizon, self.out_channels, self.out_height, self.out_width)
         return image.reshape(batch_size, horizon, self.out_channels, self.out_height, self.out_width).permute(
             0, 1, 3, 4, 2
         )
+
+
+def _future_images_to_nchw(images: Tensor) -> Tensor:
+    """Convert [B, T, H, W, C] or [B, T, C, H, W] images to [B*T, C, H, W]."""
+    if images.ndim != 5:
+        raise ValueError(f"Expected rank-5 future images, got {tuple(images.shape)}.")
+    batch_size, horizon = images.shape[:2]
+    if images.shape[2] in (1, 3):
+        return images.reshape(batch_size * horizon, *images.shape[2:])
+    if images.shape[-1] in (1, 3):
+        return images.permute(0, 1, 4, 2, 3).reshape(
+            batch_size * horizon,
+            images.shape[-1],
+            images.shape[2],
+            images.shape[3],
+        )
+    raise ValueError(f"Could not infer the channel dimension for future images shaped {tuple(images.shape)}.")
+
+
+def _ssim_loss(pred: Tensor, target: Tensor, window_size: int = 7, levels: int = 4) -> Tensor:
+    """Dependency-free multi-scale SSIM loss, returned per image."""
+    pred = (pred + 1.0) * 0.5
+    target = (target + 1.0) * 0.5
+    losses = []
+    for _ in range(levels):
+        padding = window_size // 2
+        mu_pred = F.avg_pool2d(pred, window_size, stride=1, padding=padding)
+        mu_target = F.avg_pool2d(target, window_size, stride=1, padding=padding)
+        sigma_pred = (F.avg_pool2d(pred.square(), window_size, stride=1, padding=padding) - mu_pred.square()).clamp_min(
+            0.0
+        )
+        sigma_target = (
+            F.avg_pool2d(target.square(), window_size, stride=1, padding=padding) - mu_target.square()
+        ).clamp_min(0.0)
+        sigma_cross = F.avg_pool2d(pred * target, window_size, stride=1, padding=padding) - mu_pred * mu_target
+        c1 = 0.01**2
+        c2 = 0.03**2
+        ssim = ((2 * mu_pred * mu_target + c1) * (2 * sigma_cross + c2)) / (
+            (mu_pred.square() + mu_target.square() + c1) * (sigma_pred + sigma_target + c2)
+        ).clamp_min(1e-6)
+        losses.append((1.0 - ssim.clamp(-1.0, 1.0)).flatten(1).mean(1))
+        if min(pred.shape[-2:]) <= window_size * 2:
+            break
+        pred = F.avg_pool2d(pred, kernel_size=2, stride=2)
+        target = F.avg_pool2d(target, kernel_size=2, stride=2)
+    return torch.stack(losses).mean(0)
+
+
+def _gradient_loss(pred: Tensor, target: Tensor) -> Tensor:
+    pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+    target_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
+    pred_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+    target_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
+    loss_x = (pred_dx - target_dx).abs().flatten(1).mean(1)
+    loss_y = (pred_dy - target_dy).abs().flatten(1).mean(1)
+    return 0.5 * (loss_x + loss_y)
+
+
+def _pyramid_loss(pred: Tensor, target: Tensor, levels: int = 4) -> Tensor:
+    """Multi-scale structural L1 loss used as a lightweight perceptual term."""
+    losses = []
+    for _ in range(levels):
+        losses.append((pred - target).abs().flatten(1).mean(1))
+        if min(pred.shape[-2:]) <= 8:
+            break
+        pred = F.avg_pool2d(pred, kernel_size=2, stride=2)
+        target = F.avg_pool2d(target, kernel_size=2, stride=2)
+    return torch.stack(losses).mean(0)
+
+
+def _reconstruction_loss_terms(pred: Tensor, target: Tensor) -> dict[str, Tensor]:
+    """Return per-[batch, horizon] image reconstruction terms."""
+    batch_size, horizon = pred.shape[:2]
+    pred_nchw = _future_images_to_nchw(pred).to(dtype=torch.float32)
+    target_nchw = _future_images_to_nchw(target).to(dtype=torch.float32)
+    difference = pred_nchw - target_nchw
+    reshape = lambda value: value.reshape(batch_size, horizon)  # noqa: E731
+    return {
+        "mse": reshape(difference.square().flatten(1).mean(1)),
+        "charbonnier": reshape(torch.sqrt(difference.square() + 1e-6).flatten(1).mean(1)),
+        "ssim": reshape(_ssim_loss(pred_nchw, target_nchw)),
+        "gradient": reshape(_gradient_loss(pred_nchw, target_nchw)),
+        "pyramid": reshape(_pyramid_loss(pred_nchw, target_nchw)),
+    }
+
+
+def _temporal_difference_loss(pred: Tensor, target: Tensor) -> Tensor:
+    """Match frame-to-frame motion and return a [batch, horizon] loss."""
+    pred_nchw = _future_images_to_nchw(pred)
+    target_nchw = _future_images_to_nchw(target)
+    batch_size, horizon = pred.shape[:2]
+    pred_nchw = pred_nchw.reshape(batch_size, horizon, *pred_nchw.shape[1:])
+    target_nchw = target_nchw.reshape(batch_size, horizon, *target_nchw.shape[1:])
+    temporal = (pred_nchw[:, 1:] - pred_nchw[:, :-1]) - (target_nchw[:, 1:] - target_nchw[:, :-1])
+    temporal = temporal.to(dtype=torch.float32).abs().flatten(2).mean(2)
+    return F.pad(temporal, (1, 0))
+
+
+def create_future_visuotactile_autoencoder(config) -> FutureVisuoTactileVisionAutoencoder:
+    """Build the standalone future-image codec from a Pi0 visuo-tactile config."""
+    future_shape = _config_get(config, "future_visuotactile_shape", None)
+    if future_shape is None:
+        raise ValueError("future_visuotactile_shape is required to create the autoencoder.")
+    return FutureVisuoTactileVisionAutoencoder(
+        latent_dim=_config_get(config, "future_visuotactile_latent_dim", 16),
+        future_shape=tuple(future_shape),
+        encoder_width=_config_get(config, "future_visuotactile_encoder_width", 64),
+        decoder_width=_config_get(config, "future_visuotactile_decoder_width", 256),
+        decoder_depth=_config_get(config, "future_visuotactile_decoder_depth", 2),
+        latent_grid_size=_config_get(config, "future_visuotactile_latent_grid_size", None),
+    )
 
 
 class PI0VisuoTactilePytorch(PI0Pytorch):
@@ -202,34 +362,26 @@ class PI0VisuoTactilePytorch(PI0Pytorch):
     def __init__(self, config):
         super().__init__(config)
 
-        vlm_width = self.paligemma_with_expert.paligemma.config.text_config.hidden_size
         expert_width = self.action_in_proj.out_features
 
         self.visuotactile_keys = _as_tuple(
             _config_get(config, "visuotactile_keys", ("visuotactile_0_rgb", "tactile_0_rgb"))
         )
         self.future_visuotactile_key = _config_get(config, "future_visuotactile_key", "future_visuotactile")
-        self.future_visuotactile_latent_dim = _config_get(
-            config, "future_visuotactile_latent_dim", config.action_dim
-        )
         self.action_loss_weight = _config_get(config, "action_loss_weight", 1.0)
         self.future_flow_loss_weight = _config_get(config, "future_flow_loss_weight", 1.0)
         self.future_visuotactile_loss_weight = _config_get(config, "future_visuotactile_loss_weight", 1.0)
+        self.future_autoencoder_loss_weight = _config_get(config, "future_autoencoder_loss_weight", 1.0)
+        self.future_mse_loss_weight = _config_get(config, "future_mse_loss_weight", 0.1)
+        self.future_charbonnier_loss_weight = _config_get(config, "future_charbonnier_loss_weight", 1.0)
+        self.future_ssim_loss_weight = _config_get(config, "future_ssim_loss_weight", 0.2)
+        self.future_gradient_loss_weight = _config_get(config, "future_gradient_loss_weight", 0.1)
+        self.future_pyramid_loss_weight = _config_get(config, "future_pyramid_loss_weight", 0.1)
+        self.future_temporal_loss_weight = _config_get(config, "future_temporal_loss_weight", 0.2)
 
-        future_shape = _config_get(config, "future_visuotactile_shape", None)
-        if future_shape is None:
-            raise ValueError("PI0VisuoTactilePytorch requires config.future_visuotactile_shape.")
-        self.future_visuotactile_autoencoder = FutureVisuoTactileVisionAutoencoder(
-            image_encoder=self.paligemma_with_expert.embed_image,
-            encoder_width=vlm_width,
-            latent_dim=self.future_visuotactile_latent_dim,
-            future_shape=tuple(future_shape),
-            decoder_width=_config_get(config, "future_visuotactile_decoder_width", 512),
-            decoder_depth=_config_get(config, "future_visuotactile_decoder_depth", 4),
-            decoder_num_heads=_config_get(config, "future_visuotactile_decoder_num_heads", 8),
-            patch_size=_config_get(config, "future_visuotactile_patch_size", 16),
-            encoder_chunk_size=_config_get(config, "future_visuotactile_encoder_chunk_size", 8),
-        )
+        self.future_visuotactile_autoencoder = create_future_visuotactile_autoencoder(config)
+        self.pretrained_autoencoder_loaded = False
+        self.future_visuotactile_latent_dim = self.future_visuotactile_autoencoder.flat_latent_dim
 
         self.joint_action_dim = config.action_dim + self.future_visuotactile_latent_dim
         self.action_future_in_proj = nn.Linear(self.joint_action_dim, expert_width)
@@ -241,11 +393,100 @@ class PI0VisuoTactilePytorch(PI0Pytorch):
 
     def gradient_checkpointing_enable(self):
         super().gradient_checkpointing_enable()
-        self.future_visuotactile_autoencoder.gradient_checkpointing_enabled = True
 
     def gradient_checkpointing_disable(self):
         super().gradient_checkpointing_disable()
-        self.future_visuotactile_autoencoder.gradient_checkpointing_enabled = False
+
+    def get_training_phase(self, step: int) -> str:
+        autoencoder_steps = _config_get(self.config, "future_autoencoder_pretrain_steps", 0)
+        joint_start_step = _config_get(self.config, "future_joint_finetune_start_step", autoencoder_steps)
+        if not self.pretrained_autoencoder_loaded and step < autoencoder_steps:
+            return "autoencoder"
+        if step < joint_start_step:
+            return "flow"
+        return "joint"
+
+    def set_train_phase(self, phase: str) -> None:
+        """Select trainable modules for staged future-image training."""
+        if phase not in {"autoencoder", "flow", "joint"}:
+            raise ValueError(f"Unknown visuo-tactile training phase: {phase}.")
+        for parameter in self.parameters():
+            parameter.requires_grad_(phase == "joint")
+
+        if phase == "autoencoder":
+            for parameter in self.future_visuotactile_autoencoder.parameters():
+                parameter.requires_grad_(requires_grad=True)
+        elif phase == "flow":
+            trainable_modules = [
+                self.paligemma_with_expert.gemma_expert,
+                self.action_future_in_proj,
+                self.action_future_out_proj,
+            ]
+            if self.pi05:
+                trainable_modules.extend([self.time_mlp_in, self.time_mlp_out])
+            else:
+                trainable_modules.extend(
+                    [
+                        self.state_proj,
+                        self.action_future_time_mlp_in,
+                        self.action_future_time_mlp_out,
+                    ]
+                )
+            for module in trainable_modules:
+                for parameter in module.parameters():
+                    parameter.requires_grad_(requires_grad=True)
+
+        # The autoencoder is independent of the policy vision tower. Keep the
+        # latter fixed so policy image features remain anchored to the base
+        # checkpoint.
+        for parameter in self.paligemma_with_expert.paligemma.vision_tower.parameters():
+            parameter.requires_grad_(requires_grad=False)
+        if phase == "joint":
+            for encoder_module in (
+                self.future_visuotactile_autoencoder.encoder_in,
+                self.future_visuotactile_autoencoder.encoder_stages,
+                self.future_visuotactile_autoencoder.encoder_out,
+            ):
+                for parameter in encoder_module.parameters():
+                    parameter.requires_grad_(requires_grad=False)
+
+    def _weighted_reconstruction_loss(
+        self,
+        pred: Tensor,
+        target: Tensor,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        terms = _reconstruction_loss_terms(pred, target)
+        terms["temporal"] = _temporal_difference_loss(pred, target)
+        total = (
+            self.future_mse_loss_weight * terms["mse"]
+            + self.future_charbonnier_loss_weight * terms["charbonnier"]
+            + self.future_ssim_loss_weight * terms["ssim"]
+            + self.future_gradient_loss_weight * terms["gradient"]
+            + self.future_pyramid_loss_weight * terms["pyramid"]
+            + self.future_temporal_loss_weight * terms["temporal"]
+        )
+        return total, terms
+
+    def _autoencoder_forward(self, future_visuotactile: Tensor, *, return_dict: bool):
+        future_latents = self.future_visuotactile_autoencoder.encode(future_visuotactile)
+        reconstruction = self.future_visuotactile_autoencoder.decode(future_latents)
+        autoencoder_loss, terms = self._weighted_reconstruction_loss(reconstruction, future_visuotactile)
+        loss = self.future_autoencoder_loss_weight * autoencoder_loss
+        if not return_dict:
+            return loss
+        return {
+            "loss": loss,
+            "future_autoencoder_loss": autoencoder_loss,
+            "future_recon_loss": autoencoder_loss,
+            "future_recon_mse": terms["mse"],
+            "future_recon_charbonnier": terms["charbonnier"],
+            "future_recon_ssim": terms["ssim"],
+            "future_recon_gradient": terms["gradient"],
+            "future_recon_pyramid": terms["pyramid"],
+            "future_recon_temporal": terms["temporal"],
+            "pred_future_visuotactile": reconstruction,
+            "future_visuotactile_latents": future_latents,
+        }
 
     def _get_future_visuotactile(self, observation, future_visuotactile=None):
         if future_visuotactile is not None:
@@ -409,6 +650,7 @@ class PI0VisuoTactilePytorch(PI0Pytorch):
             action_future_time_emb = self._apply_checkpoint(mlp_func, action_future_time_emb)
             adarms_cond = None
         else:
+
             def time_mlp_func(x):
                 x = self.time_mlp_in(x)
                 x = F.silu(x)
@@ -429,9 +671,20 @@ class PI0VisuoTactilePytorch(PI0Pytorch):
         att_masks = att_masks[None, :].expand(batch_size, len(att_masks))
         return embs, pad_masks, att_masks, adarms_cond
 
-    def _predict_vector_field(self, prefix_embs, prefix_pad_masks, prefix_att_masks, suffix_embs, suffix_pad_masks,
-                              suffix_att_masks, adarms_cond):
-        if self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
+    def _predict_vector_field(
+        self,
+        prefix_embs,
+        prefix_pad_masks,
+        prefix_att_masks,
+        suffix_embs,
+        suffix_pad_masks,
+        suffix_att_masks,
+        adarms_cond,
+    ):
+        if (
+            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
@@ -468,11 +721,15 @@ class PI0VisuoTactilePytorch(PI0Pytorch):
         time=None,
         *,
         return_dict: bool = False,
+        training_phase: str = "joint",
     ):
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
         future_visuotactile = self._get_future_visuotactile(observation, future_visuotactile)
         if future_visuotactile is None:
             raise ValueError("future_visuotactile is required for PI0VisuoTactilePytorch.forward.")
+        if training_phase == "autoencoder":
+            return self._autoencoder_forward(future_visuotactile, return_dict=return_dict)
+
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
         future_latents = self.future_visuotactile_autoencoder.encode(future_visuotactile)
         if future_latents.shape[:2] != actions.shape[:2]:
@@ -481,10 +738,14 @@ class PI0VisuoTactilePytorch(PI0Pytorch):
                 f"got {tuple(future_latents.shape)} for actions {tuple(actions.shape)}."
             )
 
-        clean = torch.cat([actions, future_latents], dim=-1)
+        # Flow matching treats encoded data as a fixed target. Without this
+        # detach, the encoder can reduce flow loss by mapping every image to a
+        # nearly constant latent.
+        flow_future_latents = future_latents.detach()
+        clean = torch.cat([actions, flow_future_latents], dim=-1)
         action_noise = self.sample_noise(actions.shape, actions.device) if noise is None else noise
         if future_noise is None:
-            future_noise = self.sample_noise(future_latents.shape, future_latents.device)
+            future_noise = self.sample_noise(flow_future_latents.shape, flow_future_latents.device)
         joint_noise = torch.cat([action_noise, future_noise], dim=-1)
 
         if time is None:
@@ -499,13 +760,17 @@ class PI0VisuoTactilePytorch(PI0Pytorch):
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         v_t = self._predict_vector_field(
-            prefix_embs, prefix_pad_masks, prefix_att_masks, suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond
+            prefix_embs,
+            prefix_pad_masks,
+            prefix_att_masks,
+            suffix_embs,
+            suffix_pad_masks,
+            suffix_att_masks,
+            adarms_cond,
         )
 
         action_v_t, future_v_t = torch.split(v_t, [self.config.action_dim, self.future_visuotactile_latent_dim], dim=-1)
-        action_u_t, future_u_t = torch.split(
-            u_t, [self.config.action_dim, self.future_visuotactile_latent_dim], dim=-1
-        )
+        action_u_t, future_u_t = torch.split(u_t, [self.config.action_dim, self.future_visuotactile_latent_dim], dim=-1)
         _, noisy_future_latents = torch.split(
             x_t, [self.config.action_dim, self.future_visuotactile_latent_dim], dim=-1
         )
@@ -514,12 +779,25 @@ class PI0VisuoTactilePytorch(PI0Pytorch):
         future_flow_loss = F.mse_loss(future_v_t, future_u_t, reduction="none").mean(dim=-1)
         pred_clean_future_latents = noisy_future_latents - time_expanded * future_v_t
         pred_future_visuotactile = self.future_visuotactile_autoencoder.decode(pred_clean_future_latents)
-        future_recon_loss = F.mse_loss(pred_future_visuotactile, future_visuotactile, reduction="none").flatten(2).mean(2)
+        future_recon_loss, future_recon_terms = self._weighted_reconstruction_loss(
+            pred_future_visuotactile,
+            future_visuotactile,
+        )
+
+        if training_phase == "joint":
+            autoencoder_reconstruction = self.future_visuotactile_autoencoder.decode(future_latents)
+            future_autoencoder_loss, _ = self._weighted_reconstruction_loss(
+                autoencoder_reconstruction,
+                future_visuotactile,
+            )
+        else:
+            future_autoencoder_loss = torch.zeros_like(future_recon_loss)
 
         loss = (
             self.action_loss_weight * action_loss
             + self.future_flow_loss_weight * future_flow_loss
             + self.future_visuotactile_loss_weight * future_recon_loss
+            + self.future_autoencoder_loss_weight * future_autoencoder_loss
         )
         if not return_dict:
             return loss
@@ -529,6 +807,13 @@ class PI0VisuoTactilePytorch(PI0Pytorch):
             "action_loss": action_loss,
             "future_flow_loss": future_flow_loss,
             "future_recon_loss": future_recon_loss,
+            "future_autoencoder_loss": future_autoencoder_loss,
+            "future_recon_mse": future_recon_terms["mse"],
+            "future_recon_charbonnier": future_recon_terms["charbonnier"],
+            "future_recon_ssim": future_recon_terms["ssim"],
+            "future_recon_gradient": future_recon_terms["gradient"],
+            "future_recon_pyramid": future_recon_terms["pyramid"],
+            "future_recon_temporal": future_recon_terms["temporal"],
             "pred_action_velocity": action_v_t,
             "pred_future_velocity": future_v_t,
             "pred_future_visuotactile": pred_future_visuotactile,

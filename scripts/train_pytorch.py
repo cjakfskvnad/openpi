@@ -27,6 +27,7 @@ import dataclasses
 import gc
 import logging
 import os
+import pathlib
 import pickle
 import platform
 import shutil
@@ -42,6 +43,7 @@ import tqdm
 import wandb
 
 import openpi.models.pi0_config
+import openpi.models_pytorch.pi0_expertvisuotactile_pytorch
 import openpi.models_pytorch.pi0_pytorch
 import openpi.models_pytorch.pi0_visuotactile_pytorch
 import openpi.shared.normalize as _normalize
@@ -149,6 +151,103 @@ def get_model_parameters(model):
     )
 
 
+def unwrap_model(model):
+    return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+
+
+def build_optimizer_param_groups(model, model_cfg, peak_lr):
+    """Use a higher LR for new future heads and a lower LR for the pretrained backbone."""
+    if not isinstance(model_cfg, openpi.models.pi0_config.Pi0VisuoTactileConfig):
+        return [
+            {
+                "name": "model",
+                "params": list(model.parameters()),
+                "lr": peak_lr,
+                "lr_scale": 1.0,
+            }
+        ]
+
+    core_model = unwrap_model(model)
+    separate_tactile_expert = model_cfg.use_separate_visuotactile_expert
+    groups = {"future_head": [], "tactile_expert": [], "action_expert": [], "backbone": []}
+    for name, parameter in core_model.named_parameters():
+        if separate_tactile_expert and name.startswith(
+            (
+                "paligemma_with_expert.gemma_visuotactile_expert.",
+                "visuotactile_in_proj.",
+                "visuotactile_out_proj.",
+                "visuotactile_time_mlp_",
+            )
+        ):
+            groups["tactile_expert"].append(parameter)
+        elif not separate_tactile_expert and name.startswith(
+            ("future_visuotactile_autoencoder.", "action_future_")
+        ):
+            groups["future_head"].append(parameter)
+        elif name.startswith(
+            (
+                "paligemma_with_expert.gemma_expert.",
+                "time_mlp_",
+                "action_future_time_mlp_",
+            )
+        ):
+            groups["action_expert"].append(parameter)
+        else:
+            groups["backbone"].append(parameter)
+
+    scales = {
+        "future_head": model_cfg.future_head_lr_multiplier,
+        "tactile_expert": model_cfg.future_head_lr_multiplier,
+        "action_expert": 1.0,
+        "backbone": model_cfg.future_backbone_lr_multiplier,
+    }
+    return [
+        {
+            "name": name,
+            "params": parameters,
+            "lr": peak_lr * scales[name],
+            "lr_scale": scales[name],
+        }
+        for name, parameters in groups.items()
+        if parameters
+    ]
+
+
+def clip_optimizer_param_groups(optimizer, max_norm):
+    """Clip groups independently so a large backbone cannot suppress a new decoder."""
+    squared_norm = 0.0
+    group_norms = {}
+    for group in optimizer.param_groups:
+        parameters = [parameter for parameter in group["params"] if parameter.grad is not None]
+        if not parameters:
+            continue
+        group_norm = torch.nn.utils.clip_grad_norm_(parameters, max_norm=max_norm)
+        group_norm_value = float(group_norm)
+        group_norms[group.get("name", "model")] = group_norm_value
+        squared_norm += group_norm_value**2
+    return squared_norm**0.5, group_norms
+
+
+def resolve_autoencoder_checkpoint(path: str | os.PathLike) -> pathlib.Path:
+    candidate = pathlib.Path(path)
+    if candidate.is_file():
+        return candidate
+    direct = candidate / "autoencoder.safetensors"
+    if direct.is_file():
+        return direct
+    if candidate.is_dir():
+        step_directories = sorted(
+            (child for child in candidate.iterdir() if child.is_dir() and child.name.isdigit()),
+            key=lambda child: int(child.name),
+            reverse=True,
+        )
+        for step_directory in step_directories:
+            checkpoint = step_directory / "autoencoder.safetensors"
+            if checkpoint.is_file():
+                return checkpoint
+    raise FileNotFoundError(f"Could not find autoencoder.safetensors under {candidate}.")
+
+
 def _make_checkpoint_metadata_value(value):
     """Convert config values to a form that torch.save can pickle."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
@@ -158,8 +257,7 @@ def _make_checkpoint_metadata_value(value):
         }
     if isinstance(value, dict):
         return {
-            _make_checkpoint_metadata_value(key): _make_checkpoint_metadata_value(item)
-            for key, item in value.items()
+            _make_checkpoint_metadata_value(key): _make_checkpoint_metadata_value(item) for key, item in value.items()
         }
     if isinstance(value, tuple):
         return tuple(_make_checkpoint_metadata_value(item) for item in value)
@@ -370,10 +468,9 @@ def train_loop(config: _config.TrainConfig):
         if is_main:
             exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
             logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
-    else:
+    elif is_main:
         # For resume, checkpoint_dir is already set to the experiment directory
-        if is_main:
-            logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
+        logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
 
     if use_ddp:
         dist.barrier()
@@ -442,17 +539,28 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    if isinstance(model_cfg, openpi.models.pi0_config.Pi0VisuoTactileConfig):
+    if (
+        isinstance(model_cfg, openpi.models.pi0_config.Pi0VisuoTactileConfig)
+        and model_cfg.use_separate_visuotactile_expert
+    ):
+        model = openpi.models_pytorch.pi0_expertvisuotactile_pytorch.PI0ExpertVisuoTactilePytorch(model_cfg).to(
+            device
+        )
+    elif isinstance(model_cfg, openpi.models.pi0_config.Pi0VisuoTactileConfig):
         model = openpi.models_pytorch.pi0_visuotactile_pytorch.PI0VisuoTactilePytorch(model_cfg).to(device)
     else:
         model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
-    if hasattr(model, "gradient_checkpointing_enable"):
-        enable_gradient_checkpointing = True
+    enable_gradient_checkpointing = False
+    if config.pytorch_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
         logging.info("Enabled gradient checkpointing for memory optimization")
+        enable_gradient_checkpointing = True
+    elif not config.pytorch_gradient_checkpointing:
+        if hasattr(model, "gradient_checkpointing_disable"):
+            model.gradient_checkpointing_disable()
+        logging.info("Gradient checkpointing is disabled by configuration")
     else:
-        enable_gradient_checkpointing = False
         logging.info("Gradient checkpointing is not supported for this model")
 
     # Log initial memory usage after model creation
@@ -482,12 +590,36 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model),
+        core_model = unwrap_model(model)
+        missing_keys, _ = safetensors.torch.load_model(
+            core_model,
             model_path,
             strict=not isinstance(model_cfg, openpi.models.pi0_config.Pi0VisuoTactileConfig),
         )
+        if (
+            isinstance(model_cfg, openpi.models.pi0_config.Pi0VisuoTactileConfig)
+            and model_cfg.use_separate_visuotactile_expert
+        ):
+            tactile_prefix = "paligemma_with_expert.gemma_visuotactile_expert."
+            tactile_state_keys = {key for key in core_model.state_dict() if key.startswith(tactile_prefix)}
+            if tactile_state_keys and tactile_state_keys.issubset(set(missing_keys)):
+                core_model.initialize_tactile_expert_from_action_expert()
+                logging.info("Initialized the new tactile expert from the pretrained action expert")
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+
+    if (
+        isinstance(model_cfg, openpi.models.pi0_config.Pi0VisuoTactileConfig)
+        and config.pytorch_autoencoder_weight_path is not None
+    ):
+        autoencoder_path = resolve_autoencoder_checkpoint(config.pytorch_autoencoder_weight_path)
+        core_model = unwrap_model(model)
+        safetensors.torch.load_model(
+            core_model.future_visuotactile_autoencoder,
+            autoencoder_path,
+            strict=True,
+        )
+        core_model.pretrained_autoencoder_loaded = True
+        logging.info("Loaded standalone future autoencoder from %s", autoencoder_path)
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
@@ -496,9 +628,9 @@ def train_loop(config: _config.TrainConfig):
     end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
+    optimizer_param_groups = build_optimizer_param_groups(model, model_cfg, peak_lr)
     optim = torch.optim.AdamW(
-        model.parameters(),
-        lr=peak_lr,
+        optimizer_param_groups,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
         weight_decay=config.optimizer.weight_decay,
@@ -521,6 +653,7 @@ def train_loop(config: _config.TrainConfig):
         return end_lr + (peak_lr - end_lr) * cos
 
     model.train()
+    active_training_phase = None
     start_time = time.time()
     infos = []  # Collect stats over log interval
     if is_main:
@@ -562,13 +695,35 @@ def train_loop(config: _config.TrainConfig):
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
 
+            training_phase = "joint"
+            if isinstance(model_cfg, openpi.models.pi0_config.Pi0VisuoTactileConfig):
+                core_model = unwrap_model(model)
+                training_phase = core_model.get_training_phase(global_step)
+                if training_phase != active_training_phase:
+                    core_model.set_train_phase(training_phase)
+                    active_training_phase = training_phase
+                    trainable_parameters = sum(
+                        parameter.numel() for parameter in core_model.parameters() if parameter.requires_grad
+                    )
+                    logging.info(
+                        "Switched visuo-tactile training phase to %s at step %d (%d trainable parameters)",
+                        training_phase,
+                        global_step,
+                        trainable_parameters,
+                    )
+
             # Update LR
             for pg in optim.param_groups:
-                pg["lr"] = lr_schedule(global_step)
+                pg["lr"] = lr_schedule(global_step) * pg.get("lr_scale", 1.0)
 
             # Forward pass
             if isinstance(model_cfg, openpi.models.pi0_config.Pi0VisuoTactileConfig):
-                loss_outputs = model(observation, actions, return_dict=True)
+                loss_outputs = model(
+                    observation,
+                    actions,
+                    return_dict=True,
+                    training_phase=training_phase,
+                )
                 losses = loss_outputs["loss"]
             else:
                 loss_outputs = {}
@@ -589,7 +744,10 @@ def train_loop(config: _config.TrainConfig):
                 log_memory_usage(device, global_step, "after_backward")
 
             # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+            grad_norm, group_grad_norms = clip_optimizer_param_groups(
+                optim,
+                max_norm=config.optimizer.clip_gradient_norm,
+            )
 
             # Optimizer step
             optim.step()
@@ -606,9 +764,23 @@ def train_loop(config: _config.TrainConfig):
                 step_info = {
                     "loss": loss.item(),
                     "learning_rate": optim.param_groups[0]["lr"],
-                    "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                    "grad_norm": grad_norm,
+                    "training_phase": training_phase,
                 }
-                for loss_name in ("action_loss", "future_flow_loss", "future_recon_loss"):
+                step_info.update({f"grad_norm/{name}": value for name, value in group_grad_norms.items()})
+                for loss_name in (
+                    "action_loss",
+                    "future_loss",
+                    "future_flow_loss",
+                    "future_recon_loss",
+                    "future_autoencoder_loss",
+                    "future_recon_mse",
+                    "future_recon_charbonnier",
+                    "future_recon_ssim",
+                    "future_recon_gradient",
+                    "future_recon_pyramid",
+                    "future_recon_temporal",
+                ):
                     if loss_name in loss_outputs:
                         step_info[loss_name] = loss_outputs[loss_name].detach().mean().item()
                 infos.append(step_info)
@@ -622,7 +794,19 @@ def train_loop(config: _config.TrainConfig):
                 avg_extra_losses = {
                     loss_name: sum(info[loss_name] for info in infos if loss_name in info)
                     / max(1, sum(1 for info in infos if loss_name in info))
-                    for loss_name in ("action_loss", "future_flow_loss", "future_recon_loss")
+                    for loss_name in (
+                        "action_loss",
+                        "future_loss",
+                        "future_flow_loss",
+                        "future_recon_loss",
+                        "future_autoencoder_loss",
+                        "future_recon_mse",
+                        "future_recon_charbonnier",
+                        "future_recon_ssim",
+                        "future_recon_gradient",
+                        "future_recon_pyramid",
+                        "future_recon_temporal",
+                    )
                     if any(loss_name in info for info in infos)
                 }
 
@@ -651,6 +835,7 @@ def train_loop(config: _config.TrainConfig):
                         "time_per_step": elapsed / config.log_interval,
                     }
                     log_payload.update(avg_extra_losses)
+                    log_payload["training_phase"] = training_phase
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
                     wandb.log(log_payload, step=global_step)

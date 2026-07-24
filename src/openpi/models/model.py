@@ -270,7 +270,12 @@ class BaseModelConfig(abc.ABC):
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
         if train_config.model.__class__.__name__ == "Pi0VisuoTactileConfig":
-            model = pi0_visuotactile_pytorch.PI0VisuoTactilePytorch(config=train_config.model)
+            if train_config.model.use_separate_visuotactile_expert:
+                from openpi.models_pytorch import pi0_expertvisuotactile_pytorch
+
+                model = pi0_expertvisuotactile_pytorch.PI0ExpertVisuoTactilePytorch(config=train_config.model)
+            else:
+                model = pi0_visuotactile_pytorch.PI0VisuoTactilePytorch(config=train_config.model)
             safetensors.torch.load_model(model, weight_path, strict=False)
         else:
             model = pi0_pytorch.PI0Pytorch(config=train_config.model)

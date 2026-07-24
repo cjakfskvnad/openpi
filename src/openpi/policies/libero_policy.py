@@ -96,7 +96,7 @@ class LiberoInputs(transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class LiberoVisuoTactileInputs(transforms.DataTransformFn):
-    """Libero inputs that reuse the head camera as current and future visuo-tactile signal."""
+    """Libero inputs with the head camera used as a strictly-future image target."""
 
     model_type: _model.ModelType
 
@@ -104,7 +104,12 @@ class LiberoVisuoTactileInputs(transforms.DataTransformFn):
         head_images = _parse_image_sequence(data["observation/image"])
         base_image = head_images[0]
         wrist_image = _parse_image(data["observation/wrist_image"])
-        future_visuotactile = np.asarray(image_tools.resize_with_pad(head_images, 224, 224))
+        # Training requests H+1 head-camera frames: frame zero remains the
+        # current observation and only t+1...t+H are reconstruction targets.
+        # Policy inference supplies one current frame and does not consume this
+        # placeholder target.
+        future_head_images = head_images[1:] if len(head_images) > 1 else head_images
+        future_visuotactile = np.asarray(image_tools.resize_with_pad(future_head_images, 224, 224))
         future_visuotactile = future_visuotactile.astype(np.float32) / 255.0 * 2.0 - 1.0
 
         inputs = {
@@ -113,13 +118,11 @@ class LiberoVisuoTactileInputs(transforms.DataTransformFn):
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": wrist_image,
                 "right_wrist_0_rgb": np.zeros_like(base_image),
-                "visuotactile_0_rgb": base_image,
             },
             "image_mask": {
                 "base_0_rgb": np.True_,
                 "left_wrist_0_rgb": np.True_,
                 "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
-                "visuotactile_0_rgb": np.True_,
             },
             "future_visuotactile": future_visuotactile,
         }

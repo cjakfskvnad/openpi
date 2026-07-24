@@ -86,6 +86,9 @@ class DataConfig:
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
+    # Some sequence targets need one extra sample so transforms can retain the
+    # current observation and use only t+1...t+H as supervision.
+    action_sequence_extra_steps: dict[str, int] = dataclasses.field(default_factory=dict)
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
@@ -481,9 +484,16 @@ class TrainConfig:
 
     # Optional path to a PyTorch checkpoint to load weights from.
     pytorch_weight_path: str | None = None
+    # Optional standalone future-image autoencoder checkpoint. This is loaded
+    # after the base Pi0 weights and fixes the latent coordinate system used by
+    # future flow matching.
+    pytorch_autoencoder_weight_path: str | None = None
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
+    # Trade compute for activation memory in the PyTorch transformer stacks.
+    # Disable from the CLI with --no-pytorch-gradient-checkpointing.
+    pytorch_gradient_checkpointing: bool = True
 
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
@@ -939,7 +949,9 @@ _CONFIGS = [
             action_horizon=50,
             action_dim=32,
             future_visuotactile_shape=(3, 16, 16),
-            future_visuotactile_latent_dim=32,
+            future_visuotactile_latent_dim=8,
+            future_visuotactile_latent_grid_size=(4, 4),
+            future_visuotactile_decoder_width=128,
         ),
         data=SimpleDataConfig(
             repo_id="your_hf_username/your_visuotactile_dataset",
@@ -977,9 +989,10 @@ _CONFIGS = [
             action_dim=32,
             action_horizon=10,
             future_visuotactile_shape=(224, 224, 3),
-            future_visuotactile_latent_dim=32,
-            future_visuotactile_decoder_width=512,
-            future_visuotactile_decoder_depth=4,
+            future_visuotactile_latent_dim=16,
+            future_visuotactile_latent_grid_size=(14, 14),
+            future_visuotactile_decoder_width=256,
+            future_visuotactile_decoder_depth=2,
             future_visuotactile_decoder_num_heads=8,
             future_visuotactile_patch_size=16,
         ),
@@ -992,6 +1005,7 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 action_sequence_keys=("actions", "image"),
+                action_sequence_extra_steps={"image": 1},
                 repack_transforms=_transforms.Group(
                     inputs=[
                         _transforms.RepackTransform(
@@ -1018,9 +1032,10 @@ _CONFIGS = [
             action_horizon=10,
             discrete_state_input=False,
             future_visuotactile_shape=(224, 224, 3),
-            future_visuotactile_latent_dim=32,
-            future_visuotactile_decoder_width=512,
-            future_visuotactile_decoder_depth=4,
+            future_visuotactile_latent_dim=16,
+            future_visuotactile_latent_grid_size=(14, 14),
+            future_visuotactile_decoder_width=256,
+            future_visuotactile_decoder_depth=2,
             future_visuotactile_decoder_num_heads=8,
             future_visuotactile_patch_size=16,
         ),
@@ -1034,6 +1049,7 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 action_sequence_keys=("actions", "image"),
+                action_sequence_extra_steps={"image": 1},
                 repack_transforms=_transforms.Group(
                     inputs=[
                         _transforms.RepackTransform(
@@ -1052,6 +1068,59 @@ _CONFIGS = [
         pytorch_weight_path="checkpoints/pytorch/pi05_base",
         batch_size=32,
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_expert_visuotactile_libero",
+        model=pi0_config.Pi0VisuoTactileConfig(
+            pi05=True,
+            use_separate_visuotactile_expert=True,
+            action_dim=32,
+            action_horizon=10,
+            discrete_state_input=False,
+            future_visuotactile_shape=(224, 224, 3),
+            future_visuotactile_latent_dim=16,
+            future_visuotactile_latent_grid_size=(14, 14),
+            future_visuotactile_encoder_width=64,
+            future_visuotactile_decoder_width=256,
+            future_visuotactile_decoder_depth=2,
+            future_joint_finetune_start_step=5_000,
+            future_joint_flow_loss_weight=0.05,
+            future_joint_visuotactile_loss_weight=0.1,
+            future_joint_autoencoder_loss_weight=0.05,
+        ),
+        data=SimpleDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(assets_dir="assets/pi05_libero"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[libero_policy.LiberoVisuoTactileInputs(model_type=model.model_type)],
+                outputs=[libero_policy.LiberoOutputs()],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("actions", "image"),
+                action_sequence_extra_steps={"image": 1},
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image": "image",
+                                "observation/wrist_image": "wrist_image",
+                                "observation/state": "state",
+                                "actions": "actions",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+            ),
+        ),
+        pytorch_weight_path="checkpoints/pytorch/pi05_base",
+        pytorch_autoencoder_weight_path=(
+            "checkpoints/future_visuotactile_autoencoder/libero_headcam_singleframe_ae/7000"
+        ),
+        batch_size=32,
+        num_train_steps=30_000,
+        wandb_enabled=True,
     ),
     #
     # Debugging configs.
