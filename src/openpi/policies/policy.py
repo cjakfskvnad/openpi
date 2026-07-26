@@ -66,25 +66,39 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
-        # Make a copy since transformations may modify the inputs in place.
-        inputs = jax.tree.map(lambda x: x, obs)
-        inputs = self._input_transform(inputs)
+        return self.infer_batch([obs], noise=noise)[0]
+
+    @override
+    def infer_batch(self, observations: Sequence[dict], *, noise: np.ndarray | None = None) -> list[dict]:  # type: ignore[misc]
+        if not observations:
+            return []
+
+        # Transforms consume unbatched samples (notably prompts), so transform each
+        # observation first and stack only the model-ready arrays.
+        transformed = []
+        for obs in observations:
+            inputs = jax.tree.map(lambda x: x, obs)
+            transformed.append(self._input_transform(inputs))
+        inputs = jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *transformed)
+
         if not self._is_pytorch_model:
-            # Make a batch and convert to jax.Array.
-            inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+            inputs = jax.tree.map(jnp.asarray, inputs)
             self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
         else:
-            # Convert inputs to PyTorch tensors and move to correct device
-            inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
+            inputs = jax.tree.map(lambda x: torch.from_numpy(np.asarray(x)).to(self._pytorch_device), inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
         if noise is not None:
+            noise = np.asarray(noise)
+            if noise.ndim == 2:
+                noise = np.broadcast_to(noise, (len(observations), *noise.shape)).copy()
+            if noise.shape[0] != len(observations):
+                raise ValueError(
+                    f"Noise batch size {noise.shape[0]} does not match observation batch size {len(observations)}."
+                )
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
-
-            if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
-                noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
 
         observation = _model.Observation.from_dict(inputs)
@@ -95,15 +109,19 @@ class Policy(BasePolicy):
         }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
-            outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
+            outputs = jax.tree.map(lambda x: np.asarray(x.detach().cpu()), outputs)
         else:
-            outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
+            outputs = jax.tree.map(np.asarray, outputs)
 
-        outputs = self._output_transform(outputs)
-        outputs["policy_timing"] = {
-            "infer_ms": model_time * 1000,
-        }
-        return outputs
+        results = []
+        for batch_index in range(len(observations)):
+            element = jax.tree.map(lambda x, index=batch_index: x[index], outputs)
+            element = self._output_transform(element)
+            element["policy_timing"] = {
+                "infer_ms": model_time * 1000,
+            }
+            results.append(element)
+        return results
 
     @property
     def metadata(self) -> dict[str, Any]:
@@ -124,7 +142,17 @@ class PolicyRecorder(_base_policy.BasePolicy):
     @override
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]
         results = self._policy.infer(obs)
+        self._record(obs, results)
+        return results
 
+    @override
+    def infer_batch(self, observations: Sequence[dict]) -> list[dict]:  # type: ignore[misc]
+        results = self._policy.infer_batch(observations)
+        for obs, result in zip(observations, results, strict=True):
+            self._record(obs, result)
+        return results
+
+    def _record(self, obs: dict, results: dict) -> None:
         data = {"inputs": obs, "outputs": results}
         data = flax.traverse_util.flatten_dict(data, sep="/")
 
@@ -132,4 +160,3 @@ class PolicyRecorder(_base_policy.BasePolicy):
         self._record_step += 1
 
         np.save(output_path, np.asarray(data))
-        return results

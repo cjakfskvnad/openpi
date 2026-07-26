@@ -156,7 +156,7 @@ def unwrap_model(model):
 
 
 def build_optimizer_param_groups(model, model_cfg, peak_lr):
-    """Use a higher LR for new future heads and a lower LR for the pretrained backbone."""
+    """Keep policy parameters at the base LR and isolate future-prediction LRs."""
     if not isinstance(model_cfg, openpi.models.pi0_config.Pi0VisuoTactileConfig):
         return [
             {
@@ -169,26 +169,42 @@ def build_optimizer_param_groups(model, model_cfg, peak_lr):
 
     core_model = unwrap_model(model)
     separate_tactile_expert = model_cfg.use_separate_visuotactile_expert
-    groups = {"future_head": [], "tactile_expert": [], "action_expert": [], "backbone": []}
+    groups = {
+        # Keep this group first: the generic learning-rate metric should report
+        # the LR that updates the action policy.
+        "action_expert": [],
+        "backbone": [],
+        "tactile_encoder": [],
+        "tactile_expert": [],
+        "future_head": [],
+        "future_autoencoder": [],
+    }
     for name, parameter in core_model.named_parameters():
-        if separate_tactile_expert and name.startswith(
+        if name.startswith("future_visuotactile_autoencoder."):
+            groups["future_autoencoder"].append(parameter)
+        elif model_cfg.use_separate_tactile_encoder and name.startswith("tactile_encoder."):
+            groups["tactile_encoder"].append(parameter)
+        elif separate_tactile_expert and name.startswith(
             (
                 "paligemma_with_expert.gemma_visuotactile_expert.",
                 "visuotactile_in_proj.",
                 "visuotactile_out_proj.",
                 "visuotactile_time_mlp_",
+                "tactile_prefix_proj.",
             )
         ):
             groups["tactile_expert"].append(parameter)
-        elif not separate_tactile_expert and name.startswith(
-            ("future_visuotactile_autoencoder.", "action_future_")
-        ):
+        elif not separate_tactile_expert and name.startswith("action_future_"):
             groups["future_head"].append(parameter)
         elif name.startswith(
             (
                 "paligemma_with_expert.gemma_expert.",
+                "action_in_proj.",
+                "action_out_proj.",
                 "time_mlp_",
-                "action_future_time_mlp_",
+                "action_time_mlp_",
+                "state_proj.",
+                "state_encoder.",
             )
         ):
             groups["action_expert"].append(parameter)
@@ -196,10 +212,12 @@ def build_optimizer_param_groups(model, model_cfg, peak_lr):
             groups["backbone"].append(parameter)
 
     scales = {
-        "future_head": model_cfg.future_head_lr_multiplier,
-        "tactile_expert": model_cfg.future_head_lr_multiplier,
         "action_expert": 1.0,
-        "backbone": model_cfg.future_backbone_lr_multiplier,
+        "backbone": 1.0,
+        "tactile_encoder": 1.0,
+        "tactile_expert": model_cfg.future_head_lr_multiplier,
+        "future_head": model_cfg.future_head_lr_multiplier,
+        "future_autoencoder": model_cfg.future_backbone_lr_multiplier,
     }
     return [
         {
@@ -543,9 +561,12 @@ def train_loop(config: _config.TrainConfig):
         isinstance(model_cfg, openpi.models.pi0_config.Pi0VisuoTactileConfig)
         and model_cfg.use_separate_visuotactile_expert
     ):
-        model = openpi.models_pytorch.pi0_expertvisuotactile_pytorch.PI0ExpertVisuoTactilePytorch(model_cfg).to(
-            device
+        model_class = (
+            openpi.models_pytorch.pi0_expertvisuotactile_pytorch.PI0PrefixTactileExpertVisuoTactilePytorch
+            if model_cfg.use_prefix_tactile_expert
+            else openpi.models_pytorch.pi0_expertvisuotactile_pytorch.PI0ExpertVisuoTactilePytorch
         )
+        model = model_class(model_cfg).to(device)
     elif isinstance(model_cfg, openpi.models.pi0_config.Pi0VisuoTactileConfig):
         model = openpi.models_pytorch.pi0_visuotactile_pytorch.PI0VisuoTactilePytorch(model_cfg).to(device)
     else:

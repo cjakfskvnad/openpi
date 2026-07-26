@@ -99,6 +99,7 @@ class LiberoVisuoTactileInputs(transforms.DataTransformFn):
     """Libero inputs with the head camera used as a strictly-future image target."""
 
     model_type: _model.ModelType
+    include_current_visuotactile: bool = False
 
     def __call__(self, data: dict) -> dict:
         head_images = _parse_image_sequence(data["observation/image"])
@@ -126,6 +127,12 @@ class LiberoVisuoTactileInputs(transforms.DataTransformFn):
             },
             "future_visuotactile": future_visuotactile,
         }
+        if self.include_current_visuotactile:
+            # LIBERO has no physical tactile sensor. Use the current head-camera
+            # frame as the current visual-tactile prefix so it is temporally
+            # aligned with the future head-camera prediction targets.
+            current_visuotactile = np.asarray(image_tools.resize_with_pad(base_image, 224, 224))
+            inputs["current_visuotactile"] = current_visuotactile.astype(np.float32) / 255.0 * 2.0 - 1.0
 
         if "actions" in data:
             inputs["actions"] = data["actions"]

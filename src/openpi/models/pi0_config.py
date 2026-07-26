@@ -124,6 +124,16 @@ class Pi0VisuoTactileConfig(Pi0Config):
     # Use a third Gemma stream dedicated to future latent prediction instead
     # of concatenating future latents into the action expert.
     use_separate_visuotactile_expert: bool = False
+    # Route the current tactile prefix through the tactile Gemma expert,
+    # isolated from the VL prefix.
+    use_prefix_tactile_expert: bool = False
+    # Deprecated compatibility flag. The separate-expert PyTorch model always
+    # uses an independent tactile SigLIP encoder.
+    use_separate_tactile_encoder: bool = False
+    # How continuous robot state conditions the action expert. "none" keeps
+    # pi0.5's original behavior; "adarms" injects an encoded state through
+    # the action expert's adaptive RMSNorm layers.
+    state_input_mode: str = "none"
     visuotactile_expert_variant: _gemma.Variant = "gemma_300m"
     visuotactile_keys: tuple[str, ...] = ("visuotactile_0_rgb", "tactile_0_rgb")
     future_visuotactile_key: str = "future_visuotactile"
@@ -154,9 +164,17 @@ class Pi0VisuoTactileConfig(Pi0Config):
     future_pyramid_loss_weight: float = 0.1
     future_temporal_loss_weight: float = 0.2
 
-    # Staged PyTorch training: autoencoder only, then frozen-VAE flow
-    # matching, then low-LR joint fine-tuning.
+    # Staged expert PyTorch training: tactile-only flow matching before this
+    # boundary, then full-model joint action and future prediction training.
     future_autoencoder_pretrain_steps: int = 5_000
     future_joint_finetune_start_step: int = 5_000
     future_head_lr_multiplier: float = 4.0
     future_backbone_lr_multiplier: float = 0.25
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.state_input_mode not in {"none", "adarms"}:
+            raise ValueError(
+                "state_input_mode must be one of {'none', 'adarms'}, "
+                f"got {self.state_input_mode!r}."
+            )

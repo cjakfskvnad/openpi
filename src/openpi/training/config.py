@@ -1074,6 +1074,143 @@ _CONFIGS = [
         model=pi0_config.Pi0VisuoTactileConfig(
             pi05=True,
             use_separate_visuotactile_expert=True,
+            use_separate_tactile_encoder=True,
+            action_dim=32,
+            action_horizon=10,
+            discrete_state_input=False,
+            future_visuotactile_shape=(224, 224, 3),
+            future_visuotactile_latent_dim=16,
+            future_visuotactile_latent_grid_size=(14, 14),
+            future_visuotactile_encoder_width=64,
+            future_visuotactile_decoder_width=256,
+            future_visuotactile_decoder_depth=2,
+            future_joint_finetune_start_step=5_000,
+            future_joint_flow_loss_weight=0.05,
+            future_joint_visuotactile_loss_weight=0.1,
+            future_joint_autoencoder_loss_weight=0.05,
+            # With the LIBERO base LR below, the new future expert trains at
+            # 1e-4 while the pretrained autoencoder stays at 1.25e-5.
+            future_head_lr_multiplier=2.0,
+            future_backbone_lr_multiplier=0.25,
+        ),
+        data=SimpleDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(assets_dir="assets/pi05_libero"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[
+                    libero_policy.LiberoVisuoTactileInputs(
+                        model_type=model.model_type,
+                        include_current_visuotactile=model.use_separate_tactile_encoder,
+                    )
+                ],
+                outputs=[libero_policy.LiberoOutputs()],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("actions", "image"),
+                action_sequence_extra_steps={"image": 1},
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image": "image",
+                                "observation/wrist_image": "wrist_image",
+                                "observation/state": "state",
+                                "actions": "actions",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+            ),
+        ),
+        pytorch_weight_path="checkpoints/pytorch/pi05_base",
+        pytorch_autoencoder_weight_path=(
+            "checkpoints/future_visuotactile_autoencoder/libero_headcam_singleframe_ae/7000"
+        ),
+        batch_size=32,
+        # Match the standard pi05_libero policy schedule. Individual future
+        # modules apply the multipliers declared in the model config above.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        num_train_steps=30_000,
+        wandb_enabled=True,
+    ),
+    TrainConfig(
+        name="pi05_expert_visuotactile_state_adarms_fullft_libero",
+        model=pi0_config.Pi0VisuoTactileConfig(
+            pi05=True,
+            use_separate_visuotactile_expert=True,
+            use_separate_tactile_encoder=True,
+            state_input_mode="adarms",
+            action_dim=32,
+            action_horizon=10,
+            discrete_state_input=False,
+            future_visuotactile_shape=(224, 224, 3),
+            future_visuotactile_latent_dim=16,
+            future_visuotactile_latent_grid_size=(14, 14),
+            future_visuotactile_encoder_width=64,
+            future_visuotactile_decoder_width=256,
+            future_visuotactile_decoder_depth=2,
+            # Enter the joint phase immediately so all model parameters are
+            # trainable from the first optimization step.
+            future_joint_finetune_start_step=0,
+            future_joint_flow_loss_weight=0.05,
+            # Keep the pretrained autoencoder as the latent-space codec, but
+            # remove image reconstruction and autoencoder objectives.
+            future_joint_visuotactile_loss_weight=0.0,
+            future_joint_autoencoder_loss_weight=0.0,
+        ),
+        data=SimpleDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(assets_dir="assets/pi05_libero"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[
+                    libero_policy.LiberoVisuoTactileInputs(
+                        model_type=model.model_type,
+                        include_current_visuotactile=model.use_separate_tactile_encoder,
+                    )
+                ],
+                outputs=[libero_policy.LiberoOutputs()],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("actions", "image"),
+                action_sequence_extra_steps={"image": 1},
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image": "image",
+                                "observation/wrist_image": "wrist_image",
+                                "observation/state": "state",
+                                "actions": "actions",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+            ),
+        ),
+        pytorch_weight_path="checkpoints/pytorch/pi05_base",
+        pytorch_autoencoder_weight_path=(
+            "checkpoints/future_visuotactile_autoencoder/libero_headcam_singleframe_ae/7000"
+        ),
+        batch_size=32,
+        num_train_steps=30_000,
+        wandb_enabled=True,
+    ),
+    TrainConfig(
+        name="pi05_prefix_tactile_expert_visuotactile_libero",
+        model=pi0_config.Pi0VisuoTactileConfig(
+            pi05=True,
+            use_separate_visuotactile_expert=True,
+            use_separate_tactile_encoder=True,
+            use_prefix_tactile_expert=True,
             action_dim=32,
             action_horizon=10,
             discrete_state_input=False,
@@ -1092,7 +1229,12 @@ _CONFIGS = [
             repo_id="physical-intelligence/libero",
             assets=AssetsConfig(assets_dir="assets/pi05_libero"),
             data_transforms=lambda model: _transforms.Group(
-                inputs=[libero_policy.LiberoVisuoTactileInputs(model_type=model.model_type)],
+                inputs=[
+                    libero_policy.LiberoVisuoTactileInputs(
+                        model_type=model.model_type,
+                        include_current_visuotactile=model.use_separate_tactile_encoder,
+                    )
+                ],
                 outputs=[libero_policy.LiberoOutputs()],
             ),
             base_config=DataConfig(

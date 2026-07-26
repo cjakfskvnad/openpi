@@ -6,6 +6,7 @@ import traceback
 
 from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
+from openpi_client import websocket_api
 import websockets.asyncio.server as _server
 import websockets.frames
 
@@ -55,10 +56,10 @@ class WebsocketPolicyServer:
         while True:
             try:
                 start_time = time.monotonic()
-                obs = msgpack_numpy.unpackb(await websocket.recv())
+                request = msgpack_numpy.unpackb(await websocket.recv())
 
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+                action = _infer_request(self._policy, request)
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {
@@ -81,6 +82,17 @@ class WebsocketPolicyServer:
                     reason="Internal server error. Traceback included in previous frame.",
                 )
                 raise
+
+
+def _infer_request(policy: _base_policy.BasePolicy, request):
+    if isinstance(request, dict) and websocket_api.BATCH_REQUEST_KEY in request:
+        observations = request[websocket_api.BATCH_REQUEST_KEY]
+        if not isinstance(observations, list) or not observations:
+            raise ValueError("Batch inference requires a non-empty list of observations.")
+        return {
+            websocket_api.BATCH_RESPONSE_KEY: policy.infer_batch(observations),
+        }
+    return policy.infer(request)
 
 
 def _health_check(connection: _server.ServerConnection, request: _server.Request) -> _server.Response | None:

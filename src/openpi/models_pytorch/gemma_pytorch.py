@@ -15,6 +15,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         action_expert_config,
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
+        action_adarms_cond_dim=None,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
@@ -50,7 +51,11 @@ class PaliGemmaWithExpertModel(nn.Module):
             hidden_activation="gelu_pytorch_tanh",
             torch_dtype="float32",
             use_adarms=use_adarms[1],
-            adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
+            adarms_cond_dim=(
+                action_adarms_cond_dim or action_expert_config.width
+            )
+            if use_adarms[1]
+            else None,
         )
 
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
@@ -288,11 +293,10 @@ class PaliGemmaWithActionAndVisuoTactileExpertsModel(PaliGemmaWithExpertModel):
     layer. Consequently, the expert widths may differ, but their attention
     depth, head count, key/value head count, and head dimension must match.
 
-    Multi-stream forward passes intentionally do not use a KV cache. A cache
-    produced by a prefix-only call contains PaliGemma-projected keys and values,
-    but updating that cache from two independent suffix experts would mutate it
-    during every denoising step. Callers should run all three streams together
-    when predicting actions and future visuo-tactile latents.
+    A prefix-only pass can cache PaliGemma-projected keys and values. Subsequent
+    multi-stream passes may read that cache while jointly computing the action
+    and visuo-tactile suffixes, but they cannot update it because both suffixes
+    change at every denoising step.
     """
 
     def __init__(
@@ -302,6 +306,7 @@ class PaliGemmaWithActionAndVisuoTactileExpertsModel(PaliGemmaWithExpertModel):
         visuotactile_expert_config,
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
+        action_adarms_cond_dim=None,
     ):
         if use_adarms is None:
             use_adarms = [False, False, False]
@@ -312,6 +317,7 @@ class PaliGemmaWithActionAndVisuoTactileExpertsModel(PaliGemmaWithExpertModel):
             vlm_config,
             action_expert_config,
             use_adarms=use_adarms[:2],
+            action_adarms_cond_dim=action_adarms_cond_dim,
             precision=precision,
         )
 
@@ -385,6 +391,7 @@ class PaliGemmaWithActionAndVisuoTactileExpertsModel(PaliGemmaWithExpertModel):
         attention_mask,
         position_ids,
         adarms_cond,
+        past_key_values=None,
     ):
         models = self._models()
         active_indices = [index for index, hidden in enumerate(hidden_streams) if hidden is not None]
@@ -423,6 +430,10 @@ class PaliGemmaWithActionAndVisuoTactileExpertsModel(PaliGemmaWithExpertModel):
             sin,
             unsqueeze_dim=1,
         )
+        if past_key_values is not None:
+            prefix_key_states, prefix_value_states = past_key_values[layer_idx]
+            key_states = torch.cat([prefix_key_states, key_states], dim=2)
+            value_states = torch.cat([prefix_value_states, value_states], dim=2)
 
         reference_attention = self.paligemma.language_model.layers[layer_idx].self_attn
         attention_output, _ = modeling_gemma.eager_attention_forward(
@@ -493,8 +504,10 @@ class PaliGemmaWithActionAndVisuoTactileExpertsModel(PaliGemmaWithExpertModel):
                 use_cache,
                 adarms_cond[index],
             )
-        if past_key_values is not None or use_cache:
-            raise ValueError("KV caching is only supported for single-stream forward passes.")
+        if use_cache:
+            raise ValueError("Updating a KV cache is only supported for single-stream forward passes.")
+        if past_key_values is not None and 0 in active_indices:
+            raise ValueError("A prefix KV cache can only be used when the prefix input stream is omitted.")
 
         models = self._models()
         use_gradient_checkpointing = self.training and any(
@@ -515,6 +528,7 @@ class PaliGemmaWithActionAndVisuoTactileExpertsModel(PaliGemmaWithExpertModel):
                         attention_mask,
                         position_ids,
                         adarms_cond,
+                        past_key_values,
                     )
                     return tuple(checkpoint_outputs[index] for index in active_indices)
 
@@ -535,6 +549,7 @@ class PaliGemmaWithActionAndVisuoTactileExpertsModel(PaliGemmaWithExpertModel):
                     attention_mask,
                     position_ids,
                     adarms_cond,
+                    past_key_values,
                 )
 
         outputs = [None, None, None]

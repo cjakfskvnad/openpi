@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import logging
 import time
+from collections.abc import Sequence
 from typing import Dict, Optional, Tuple
 
 from typing_extensions import override
@@ -7,6 +10,7 @@ import websockets.sync.client
 
 from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
+from openpi_client import websocket_api
 
 
 class WebsocketClientPolicy(_base_policy.BasePolicy):
@@ -45,7 +49,24 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
 
     @override
     def infer(self, obs: Dict) -> Dict:  # noqa: UP006
-        data = self._packer.pack(obs)
+        return self._send_request(obs)
+
+    @override
+    def infer_batch(self, obs: Sequence[Dict]) -> list[Dict]:  # noqa: UP006
+        if not obs:
+            return []
+        response = self._send_request({websocket_api.BATCH_REQUEST_KEY: list(obs)})
+        if websocket_api.BATCH_RESPONSE_KEY not in response:
+            raise RuntimeError("Inference server returned an invalid batch response.")
+        results = response[websocket_api.BATCH_RESPONSE_KEY]
+        server_timing = response.get("server_timing")
+        if server_timing:
+            for result in results:
+                result["server_timing"] = dict(server_timing)
+        return results
+
+    def _send_request(self, request):
+        data = self._packer.pack(request)
         self._ws.send(data)
         response = self._ws.recv()
         if isinstance(response, str):

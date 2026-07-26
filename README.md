@@ -331,6 +331,14 @@ uv run torchrun \
     --save-interval 1000 \
     --overwrite
 
+  CUDA_VISIBLE_DEVICES=5 PYTHONPATH=src torchrun \
+    --standalone --nnodes=1 --nproc_per_node=1 \
+    scripts/train_pytorch.py pi05_expert_visuotactile_libero \
+    --exp-name libero_pi05_tactile_expert_bz16 \
+    --save-interval 1000 \
+    --batch_size 16 \
+    --overwrite
+
   # Add --no-pytorch-gradient-checkpointing to any train_pytorch.py command
   # when higher speed is preferred and GPU memory is sufficient.
 ```
@@ -364,3 +372,97 @@ We will collect common issues and their solutions here. If you encounter an issu
 | Import errors when running examples       | Make sure you've installed all dependencies with `uv sync`. Some examples may have additional requirements listed in their READMEs.                    |
 | Action dimensions mismatch                | Verify your data processing transforms match the expected input/output dimensions of your robot. Check the action space definitions in your policy classes.                                  |
 | Diverging training loss                            | Check the `q01`, `q99`, and `std` values in `norm_stats.json` for your dataset. Certain dimensions that are rarely used can end up with very small `q01`, `q99`, or `std` values, leading to huge states and actions after normalization. You can manually adjust the norm stats as a workaround. |
+
+
+
+  tmux 46（GPU 3）：
+
+  CUDA_VISIBLE_DEVICES=3 PYTHONPATH=src torchrun \
+    --standalone --nnodes=1 --nproc_per_node=1 \
+    scripts/train_pytorch.py pi05_expert_visuotactile_libero \
+    --exp-name libero_pi05_independent_tactile_full_from5k_bz8 \
+    --batch-size 8 \
+    --save-interval 1000 \
+    --overwrite
+
+  tmux 47（GPU 1）：
+
+  CUDA_VISIBLE_DEVICES=3 uv run scripts/train_pytorch.py pi05_libero \
+    --exp-name pi05_libero_batchsize8 \
+    --batch-size 8 \
+    --save-interval 5000
+
+  tmux 45（GPU 7）：
+
+  CUDA_VISIBLE_DEVICES=6 PYTHONPATH=src torchrun \
+    --standalone --nnodes=1 --nproc_per_node=1 \
+    scripts/train_pytorch.py pi05_expert_visuotactile_state_adarms_fullft_libero \
+    --exp-name libero_pi05_expert_visuotactile_state_adarms_fullft_libero \
+    --batch-size 8 \
+    --model.future-joint-finetune-start-step 0 \
+    --save-interval 5000 \
+    --overwrite
+
+  CUDA_VISIBLE_DEVICES=2 PYTHONPATH=src uv run torchrun \
+  --standalone \
+  --nnodes=1 \
+  --nproc-per-node=1 \
+  scripts/train_pytorch.py pi05_expert_visuotactile_libero \
+  --exp-name libero_action_only_with_tactile_prefix \
+  --model.future-joint-finetune-start-step 0 \
+  --model.future-joint-flow-loss-weight 0 \
+  --model.future-joint-visuotactile-loss-weight 0 \
+  --model.future-joint-autoencoder-loss-weight 0 \
+  --num-train-steps 30000 \
+  --save-interval 5000 \
+  --batch_size 8 \
+  --overwrite
+
+
+    CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src uv run torchrun \
+    --standalone \
+    --nnodes=1 \
+    --nproc-per-node=1 \
+    scripts/train_pytorch.py pi05_prefix_tactile_expert_visuotactile_libero \
+    --exp-name libero_prefix_tactile_expert \
+    --batch-size 8 \
+    --num-train-steps 30000 \
+    --save-interval 5000 \
+    --overwrite
+
+
+      cd /home/user/kunlun/muze/openpi
+
+
+  CKPT=/home/user/kunlun/muze/openpi/checkpoints/pi05_prefix_tactile_expert_visuotactile_libero/libero_prefix_tactile_expert/25000
+
+  CUDA_VISIBLE_DEVICES=3 \
+  TORCHDYNAMO_DISABLE=1 \
+  .venv/bin/python -u scripts/serve_policy.py \
+    --env LIBERO \
+    --port 8011 \
+    policy:checkpoint \
+    --policy.config=pi05_prefix_tactile_expert_visuotactile_libero \
+    --policy.dir="$CKPT"
+
+  source examples/libero/.venv/bin/activate
+  export CUDA_VISIBLE_DEVICES=6
+  export PYTHONPATH="$PWD/third_party/libero:$PYTHONPATH"
+  MUJOCO_GL=egl python examples/libero/main.py \
+    --args.host 127.0.0.1 \
+    --args.port 8011 \
+    --args.task-suite-name libero_spatial \
+    --args.num-trials-per-task 50 \
+    --args.num-parallel-envs 5
+
+
+    CUDA_VISIBLE_DEVICES=2 PYTHONPATH=src uv run torchrun \
+    --standalone \
+    --nnodes=1 \
+    --nproc-per-node=1 \
+    scripts/train_pytorch.py pi05_expert_visuotactile_libero \
+    --exp-name libero_fullft_lr_fixed \
+    --batch-size 8 \
+    --num-train-steps 30000 \
+    --model.future-joint-finetune-start-step 0 \
+    --save-interval 5000

@@ -32,6 +32,9 @@ export SERVER_ARGS="--env LIBERO policy:checkpoint --policy.config pi05_libero -
 
 # To run the libero_10 task suite:
 export CLIENT_ARGS="--args.task-suite-name libero_10"
+
+# To run 8 simulator processes and send one fixed-size batch to the policy server:
+export CLIENT_ARGS="--args.num-parallel-envs 8"
 ```
 
 ## Without Docker (not recommended)
@@ -48,7 +51,7 @@ uv pip install -e third_party/libero
 export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero
 
 # Run the simulation
-python examples/libero/main.py
+python examples/libero/main.py --args.num-parallel-envs 8
 
 # To run with glx for Mujoco instead (use this if you have egl errors):
 MUJOCO_GL=glx python examples/libero/main.py

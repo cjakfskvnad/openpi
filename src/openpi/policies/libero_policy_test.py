@@ -19,3 +19,24 @@ def test_visuotactile_inputs_use_strictly_future_frames():
     assert np.isclose(transformed["future_visuotactile"][0, 112, 112, 0], 1 / 255 * 2 - 1)
     assert np.isclose(transformed["future_visuotactile"][-1, 112, 112, 0], 10 / 255 * 2 - 1)
     assert "visuotactile_0_rgb" not in transformed["image"]
+
+
+def test_visuotactile_inputs_can_add_current_head_frame_as_prefix_tactile():
+    head_images = np.stack(
+        [np.full((8, 8, 3), fill_value=128 + frame_index, dtype=np.uint8) for frame_index in range(11)]
+    )
+    data = {
+        "observation/image": head_images,
+        "observation/wrist_image": np.zeros((8, 8, 3), dtype=np.uint8),
+        "observation/state": np.zeros(8, dtype=np.float32),
+    }
+
+    transformed = libero_policy.LiberoVisuoTactileInputs(
+        model_type=_model.ModelType.PI05,
+        include_current_visuotactile=True,
+    )(data)
+
+    assert transformed["current_visuotactile"].shape == (224, 224, 3)
+    assert transformed["current_visuotactile"].dtype == np.float32
+    assert np.isclose(transformed["current_visuotactile"][112, 112, 0], 128 / 255 * 2 - 1, atol=1e-6)
+    assert np.isclose(transformed["future_visuotactile"][0, 112, 112, 0], 129 / 255 * 2 - 1, atol=1e-6)
