@@ -27,14 +27,14 @@ import tyro
 import wandb
 
 from openpi.models import pi0_config
-from openpi.models_pytorch import pi0_visuotactile_pytorch as _visuotactile
+from openpi.models_pytorch import future_visuotactile_autoencoder as _autoencoder
 from openpi.training import config as _config
 from openpi.training import data_loader as _data
 
 
 @dataclasses.dataclass
 class Args:
-    config_name: str = "pi05_visuotactile_libero"
+    config_name: str = "pi05_expert_visuotactile_spatiotemporal_libero"
     exp_name: str = "libero_headcam_spatial_ae"
     output_dir: pathlib.Path = pathlib.Path("checkpoints/future_visuotactile_autoencoder")
     batch_size: int = 256
@@ -75,7 +75,7 @@ def reconstruction_objective(
     target: torch.Tensor,
     model_config: pi0_config.Pi0VisuoTactileConfig,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    terms = _visuotactile._reconstruction_loss_terms(prediction, target)  # noqa: SLF001
+    terms = _autoencoder.reconstruction_loss_terms(prediction, target)
     total = (
         model_config.future_mse_loss_weight * terms["mse"]
         + model_config.future_charbonnier_loss_weight * terms["charbonnier"]
@@ -184,7 +184,7 @@ def train(args: Args) -> None:
     )
     loader = _data.create_data_loader(train_config, framework="pytorch", shuffle=True)
 
-    autoencoder = _visuotactile.create_future_visuotactile_autoencoder(train_config.model).to(device)
+    autoencoder = _autoencoder.create_future_visuotactile_autoencoder(train_config.model).to(device)
     if use_ddp:
         autoencoder = torch.nn.parallel.DistributedDataParallel(
             autoencoder,

@@ -1,10 +1,4 @@
-"""PyTorch pi0 with an independent expert for future visuo-tactile prediction.
-
-Unlike :mod:`pi0_visuotactile_pytorch`, this variant does not concatenate
-future visuo-tactile latents with actions before the action expert. Actions and
-future visuo-tactile latents are embedded by separate Gemma experts and share
-attention with the PaliGemma prefix at every transformer layer.
-"""
+"""PyTorch pi0 with an independent expert for future visuo-tactile prediction."""
 
 from collections.abc import Iterable, Mapping
 import copy
@@ -15,17 +9,16 @@ import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F  # noqa: N812
-from transformers.cache_utils import DynamicCache
 from transformers.models.siglip import check as _siglip_check
 
 import openpi.models.gemma as _gemma
+from openpi.models_pytorch.future_visuotactile_autoencoder import create_future_visuotactile_autoencoder
+from openpi.models_pytorch.future_visuotactile_autoencoder import reconstruction_loss_terms
+from openpi.models_pytorch.future_visuotactile_autoencoder import temporal_difference_loss
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithActionAndVisuoTactileExpertsModel
 from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
 from openpi.models_pytorch.pi0_pytorch import create_sinusoidal_pos_embedding
 from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
-from openpi.models_pytorch.pi0_visuotactile_pytorch import _reconstruction_loss_terms
-from openpi.models_pytorch.pi0_visuotactile_pytorch import _temporal_difference_loss
-from openpi.models_pytorch.pi0_visuotactile_pytorch import create_future_visuotactile_autoencoder
 
 
 def _config_get(config: Any, name: str, default: Any) -> Any:
@@ -430,8 +423,8 @@ class PI0ExpertVisuoTactilePytorch(PI0Pytorch):
         pred: Tensor,
         target: Tensor,
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        terms = _reconstruction_loss_terms(pred, target)
-        terms["temporal"] = _temporal_difference_loss(pred, target)
+        terms = reconstruction_loss_terms(pred, target)
+        terms["temporal"] = temporal_difference_loss(pred, target)
         total = (
             self.future_mse_loss_weight * terms["mse"]
             + self.future_charbonnier_loss_weight * terms["charbonnier"]
@@ -532,24 +525,24 @@ class PI0ExpertVisuoTactilePytorch(PI0Pytorch):
         return None
 
     def _embed_visuotactile_tokens(self, tensor: Tensor) -> Tensor:
-        image_batch = self._to_rgb_image_batch(tensor)
-        if image_batch is None:
+        tactile_image_batch = self._to_rgb_image_batch(tensor)
+        if tactile_image_batch is None:
             raise ValueError(
                 "Current visuo-tactile inputs must be image-like so they can use "
-                f"the PaliGemma vision encoder. Got shape {tuple(tensor.shape)}."
+                f"the tactile vision encoder. Got shape {tuple(tensor.shape)}."
             )
-        images, steps = image_batch
-        if images.shape[-2:] != (224, 224):
-            images = F.interpolate(images, size=(224, 224), mode="bilinear", align_corners=False)
-        image_embeddings = self._apply_checkpoint(self.tactile_encoder, images)
+        tactile_images, steps = tactile_image_batch
+        if tactile_images.shape[-2:] != (224, 224):
+            tactile_images = F.interpolate(tactile_images, size=(224, 224), mode="bilinear", align_corners=False)
+        tactile_embeddings = self._apply_checkpoint(self.tactile_encoder, tactile_images)
         if steps > 1:
             batch_size = tensor.shape[0]
-            image_embeddings = image_embeddings.reshape(
+            tactile_embeddings = tactile_embeddings.reshape(
                 batch_size,
-                steps * image_embeddings.shape[1],
-                image_embeddings.shape[2],
+                steps * tactile_embeddings.shape[1],
+                tactile_embeddings.shape[2],
             )
-        return image_embeddings
+        return tactile_embeddings
 
     def embed_prefix(
         self,
@@ -1151,461 +1144,8 @@ class PI0ExpertVisuoTactilePytorch(PI0Pytorch):
         )
 
 
-class PI0PrefixTactileExpertVisuoTactilePytorch(PI0ExpertVisuoTactilePytorch):
-    """Variant whose current tactile prefix is processed by the tactile expert.
-
-    The three transformer streams are:
-
-    * PaliGemma: regular camera images and language only.
-    * Action expert: state and noisy action suffix.
-    * Tactile expert: current tactile prefix followed by the noisy future
-      tactile suffix.
-
-    Current tactile queries can only attend current tactile keys. Action and
-    future tactile suffix queries may attend the current tactile prefix, while
-    VL queries never attend it. Action and future tactile suffixes remain
-    mutually isolated.
-    """
-
-    def __init__(self, config):
-        super().__init__(config)
-        vl_width = _gemma.get_config(config.paligemma_variant).width
-        tactile_variant = _config_get(
-            config,
-            "visuotactile_expert_variant",
-            _config_get(config, "visual_tactile_expert_variant", config.action_expert_variant),
-        )
-        tactile_width = _gemma.get_config(tactile_variant).width
-        tactile_dtype = self.paligemma_with_expert.gemma_visuotactile_expert.model.layers[
-            0
-        ].self_attn.q_proj.weight.dtype
-        self.tactile_prefix_proj = nn.Linear(
-            vl_width,
-            tactile_width,
-            dtype=tactile_dtype,
-        )
-
-    def set_train_phase(self, phase: str) -> None:
-        super().set_train_phase(phase)
-        if phase == "latent":
-            for parameter in self.tactile_prefix_proj.parameters():
-                parameter.requires_grad_(requires_grad=True)
-
-    def embed_prefix(
-        self,
-        images,
-        img_masks,
-        lang_tokens,
-        lang_masks,
-        observation=None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Return separate VL and current-tactile prefix streams."""
-        vl_embeddings = []
-        vl_pad_masks = []
-
-        for image, image_mask in zip(images, img_masks, strict=True):
-            image_embedding = self._apply_checkpoint(
-                self.paligemma_with_expert.embed_image,
-                image,
-            )
-            batch_size, token_count = image_embedding.shape[:2]
-            vl_embeddings.append(image_embedding)
-            vl_pad_masks.append(image_mask[:, None].expand(batch_size, token_count))
-
-        def embed_language(tokens):
-            embedding = self.paligemma_with_expert.embed_language_tokens(tokens)
-            return embedding * math.sqrt(embedding.shape[-1])
-
-        language_embedding = self._apply_checkpoint(embed_language, lang_tokens)
-        vl_embeddings.append(language_embedding)
-        vl_pad_masks.append(lang_masks)
-        vl_embeddings = torch.cat(vl_embeddings, dim=1)
-        vl_pad_masks = torch.cat(vl_pad_masks, dim=1).to(dtype=torch.bool)
-        vl_attention_ar = torch.zeros_like(vl_pad_masks)
-
-        tactile_embeddings = []
-        tactile_pad_masks = []
-        if observation is not None:
-            for tactile, tactile_mask in self._iter_current_visuotactile(observation):
-                tactile_embedding = self._embed_visuotactile_tokens(tactile)
-                tactile_embedding = self._apply_checkpoint(
-                    self.tactile_prefix_proj,
-                    tactile_embedding,
-                )
-                batch_size, token_count = tactile_embedding.shape[:2]
-                if tactile_mask is None:
-                    token_mask = torch.ones(
-                        batch_size,
-                        token_count,
-                        dtype=torch.bool,
-                        device=tactile_embedding.device,
-                    )
-                elif tactile_mask.ndim == 1:
-                    token_mask = tactile_mask[:, None].expand(batch_size, token_count)
-                else:
-                    repeats = math.ceil(token_count / tactile_mask.shape[1])
-                    token_mask = tactile_mask.repeat_interleave(repeats, dim=1)[:, :token_count]
-                tactile_embeddings.append(tactile_embedding)
-                tactile_pad_masks.append(token_mask.to(device=tactile_embedding.device, dtype=torch.bool))
-
-        if not tactile_embeddings:
-            raise ValueError("PI0PrefixTactileExpertVisuoTactilePytorch requires at least one current tactile input.")
-        tactile_embeddings = torch.cat(tactile_embeddings, dim=1)
-        tactile_pad_masks = torch.cat(tactile_pad_masks, dim=1)
-        tactile_attention_ar = torch.zeros_like(tactile_pad_masks)
-        return (
-            vl_embeddings,
-            vl_pad_masks,
-            vl_attention_ar,
-            tactile_embeddings,
-            tactile_pad_masks,
-            tactile_attention_ar,
-        )
-
-    @staticmethod
-    def _make_prefix_tactile_attention_mask(
-        pad_mask: Tensor,
-        vl_len: int,
-        action_len: int,
-        tactile_prefix_len: int,
-    ) -> Tensor:
-        """Build the directed VL/action/current-tactile/future-tactile graph."""
-        total_len = pad_mask.shape[1]
-        tactile_start = vl_len + action_len
-        future_start = tactile_start + tactile_prefix_len
-        if not (0 <= vl_len <= tactile_start <= future_start <= total_len):
-            raise ValueError("Invalid stream lengths for prefix-tactile attention.")
-
-        allowed = torch.zeros(
-            total_len,
-            total_len,
-            dtype=torch.bool,
-            device=pad_mask.device,
-        )
-        # VL is completely independent from the tactile prefix.
-        allowed[:vl_len, :vl_len] = True
-        # Action sees normal VL context, itself, and current tactile.
-        allowed[vl_len:tactile_start, :vl_len] = True
-        allowed[vl_len:tactile_start, vl_len:tactile_start] = True
-        allowed[vl_len:tactile_start, tactile_start:future_start] = True
-        # Current tactile only sees current tactile.
-        allowed[tactile_start:future_start, tactile_start:future_start] = True
-        # Future tactile sees VL, current tactile, and itself, but not action.
-        allowed[future_start:, :vl_len] = True
-        allowed[future_start:, tactile_start:future_start] = True
-        allowed[future_start:, future_start:] = True
-
-        valid_pairs = pad_mask[:, :, None] & pad_mask[:, None, :]
-        return allowed[None, :, :] & valid_pairs
-
-    def _predict_vector_fields(
-        self,
-        vl_prefix,
-        vl_pad_mask,
-        _vl_attention_ar,
-        tactile_prefix,
-        tactile_prefix_pad_mask,
-        _tactile_prefix_attention_ar,
-        action_suffix,
-        action_pad_mask,
-        _action_attention_ar,
-        visuotactile_suffix,
-        visuotactile_pad_mask,
-        _visuotactile_attention_ar,
-        action_adarms_cond,
-        visuotactile_adarms_cond,
-    ) -> tuple[Tensor, Tensor]:
-        target_dtype = self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-        vl_prefix = vl_prefix.to(dtype=target_dtype)
-        action_suffix = action_suffix.to(dtype=target_dtype)
-        tactile_prefix = tactile_prefix.to(dtype=target_dtype)
-        visuotactile_suffix = visuotactile_suffix.to(dtype=target_dtype)
-        tactile_stream = torch.cat([tactile_prefix, visuotactile_suffix], dim=1)
-
-        pad_mask = torch.cat(
-            [
-                vl_pad_mask,
-                action_pad_mask,
-                tactile_prefix_pad_mask,
-                visuotactile_pad_mask,
-            ],
-            dim=1,
-        )
-        attention_mask = self._make_prefix_tactile_attention_mask(
-            pad_mask,
-            vl_len=vl_pad_mask.shape[1],
-            action_len=action_pad_mask.shape[1],
-            tactile_prefix_len=tactile_prefix_pad_mask.shape[1],
-        )
-        attention_mask = self._prepare_attention_masks_4d(attention_mask)
-        position_ids = torch.cumsum(pad_mask, dim=1) - 1
-
-        def joint_forward(vl_tokens, action_tokens, tactile_tokens, mask, positions, action_cond, tactile_cond):
-            outputs, _ = self.paligemma_with_expert.forward(
-                attention_mask=mask,
-                position_ids=positions,
-                past_key_values=None,
-                inputs_embeds=[vl_tokens, action_tokens, tactile_tokens],
-                use_cache=False,
-                adarms_cond=[None, action_cond, tactile_cond],
-            )
-            return outputs[1], outputs[2]
-
-        action_output, tactile_output = self._apply_checkpoint(
-            joint_forward,
-            vl_prefix,
-            action_suffix,
-            tactile_stream,
-            attention_mask,
-            position_ids,
-            action_adarms_cond,
-            visuotactile_adarms_cond,
-        )
-        action_output = action_output[:, -self.config.action_horizon :].float()
-        return (
-            self._apply_checkpoint(self.action_out_proj, action_output),
-            self._project_future_token_outputs(tactile_output),
-        )
-
-    def _build_prefix_cache(
-        self,
-        vl_prefix: Tensor,
-        vl_pad_mask: Tensor,
-        tactile_prefix: Tensor,
-        tactile_prefix_pad_mask: Tensor,
-        action_len: int,
-    ) -> DynamicCache:
-        """Cache the independent VL and tactile prefixes, then concatenate K/V.
-
-        The physical cache order is ``[VL, current tactile]``. Rotary positions
-        still follow the full training layout ``[VL, action, tactile, future]``;
-        consequently tactile positions reserve ``action_len`` positions between
-        VL and tactile even though action is not part of the cache.
-        """
-        vl_dtype = self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-        tactile_dtype = self.paligemma_with_expert.gemma_visuotactile_expert.model.layers[
-            0
-        ].self_attn.q_proj.weight.dtype
-        vl_prefix = vl_prefix.to(dtype=vl_dtype)
-        tactile_prefix = tactile_prefix.to(dtype=tactile_dtype)
-
-        vl_attention_mask = self._prepare_attention_masks_4d(vl_pad_mask[:, :, None] & vl_pad_mask[:, None, :])
-        vl_position_ids = torch.cumsum(vl_pad_mask, dim=1) - 1
-        _, vl_cache = self.paligemma_with_expert.forward(
-            attention_mask=vl_attention_mask,
-            position_ids=vl_position_ids,
-            past_key_values=None,
-            inputs_embeds=[vl_prefix, None, None],
-            use_cache=True,
-            adarms_cond=[None, None, None],
-        )
-
-        tactile_attention_mask = self._prepare_attention_masks_4d(
-            tactile_prefix_pad_mask[:, :, None] & tactile_prefix_pad_mask[:, None, :]
-        )
-        tactile_position_ids = (
-            torch.sum(vl_pad_mask, dim=1, keepdim=True) + action_len + torch.cumsum(tactile_prefix_pad_mask, dim=1) - 1
-        )
-        tactile_output = self.paligemma_with_expert.gemma_visuotactile_expert.model.forward(
-            attention_mask=tactile_attention_mask,
-            position_ids=tactile_position_ids,
-            past_key_values=None,
-            inputs_embeds=tactile_prefix,
-            use_cache=True,
-            adarms_cond=None,
-        )
-        tactile_cache = tactile_output.past_key_values
-
-        combined_cache = DynamicCache()
-        if len(vl_cache) != len(tactile_cache):
-            raise ValueError("VL and tactile prefix caches must have the same number of layers.")
-        for layer_index in range(len(vl_cache)):
-            vl_key, vl_value = vl_cache[layer_index]
-            tactile_key, tactile_value = tactile_cache[layer_index]
-            combined_cache.update(
-                torch.cat([vl_key, tactile_key], dim=2),
-                torch.cat([vl_value, tactile_value], dim=2),
-                layer_index,
-            )
-        return combined_cache
-
-    def _predict_vector_fields_with_prefix_cache(
-        self,
-        prefix_pad_masks,
-        past_key_values,
-        action_suffix,
-        action_pad_mask,
-        _action_attention_ar,
-        visuotactile_suffix,
-        visuotactile_pad_mask,
-        _visuotactile_attention_ar,
-        action_adarms_cond,
-        visuotactile_adarms_cond,
-    ) -> tuple[Tensor, Tensor]:
-        """Predict suffixes using cached VL and current-tactile K/V."""
-        vl_pad_mask, tactile_prefix_pad_mask = prefix_pad_masks
-        action_dtype = self.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.q_proj.weight.dtype
-        tactile_dtype = self.paligemma_with_expert.gemma_visuotactile_expert.model.layers[
-            0
-        ].self_attn.q_proj.weight.dtype
-        action_suffix = action_suffix.to(dtype=action_dtype)
-        visuotactile_suffix = visuotactile_suffix.to(dtype=tactile_dtype)
-
-        # Cache keys are [VL, tactile prefix]; newly computed keys are
-        # [action suffix, future tactile suffix].
-        key_pad_mask = torch.cat(
-            [
-                vl_pad_mask,
-                tactile_prefix_pad_mask,
-                action_pad_mask,
-                visuotactile_pad_mask,
-            ],
-            dim=1,
-        )
-        vl_len = vl_pad_mask.shape[1]
-        tactile_len = tactile_prefix_pad_mask.shape[1]
-        action_len = action_pad_mask.shape[1]
-        future_len = visuotactile_pad_mask.shape[1]
-        query_len = action_len + future_len
-
-        allowed = torch.zeros(
-            query_len,
-            key_pad_mask.shape[1],
-            dtype=torch.bool,
-            device=key_pad_mask.device,
-        )
-        # Action queries -> cached VL, cached tactile, and action.
-        allowed[:action_len, : vl_len + tactile_len + action_len] = True
-        # Future tactile queries -> cached VL, cached tactile, and future
-        # tactile, but never action.
-        allowed[action_len:, : vl_len + tactile_len] = True
-        allowed[action_len:, vl_len + tactile_len + action_len :] = True
-
-        query_pad_mask = torch.cat(
-            [action_pad_mask, visuotactile_pad_mask],
-            dim=1,
-        )
-        valid_pairs = query_pad_mask[:, :, None] & key_pad_mask[:, None, :]
-        attention_mask = self._prepare_attention_masks_4d(allowed[None, :, :] & valid_pairs)
-
-        vl_valid_len = torch.sum(vl_pad_mask, dim=1, keepdim=True)
-        action_position_ids = vl_valid_len + torch.cumsum(action_pad_mask, dim=1) - 1
-        future_position_ids = (
-            vl_valid_len
-            + torch.sum(action_pad_mask, dim=1, keepdim=True)
-            + torch.sum(tactile_prefix_pad_mask, dim=1, keepdim=True)
-            + torch.cumsum(visuotactile_pad_mask, dim=1)
-            - 1
-        )
-        position_ids = torch.cat(
-            [action_position_ids, future_position_ids],
-            dim=1,
-        )
-
-        outputs, _ = self.paligemma_with_expert.forward(
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=[None, action_suffix, visuotactile_suffix],
-            use_cache=False,
-            adarms_cond=[None, action_adarms_cond, visuotactile_adarms_cond],
-        )
-        action_output = outputs[1][:, -self.config.action_horizon :].float()
-        return self.action_out_proj(action_output), self._project_future_token_outputs(outputs[2])
-
-    @torch.no_grad()
-    def sample_actions(
-        self,
-        device,
-        observation,
-        noise=None,
-        future_noise=None,
-        num_steps=10,
-        *,
-        return_future_visuotactile: bool = False,
-    ) -> Tensor | dict[str, Tensor]:
-        """Sample with independently built and merged VL/tactile prefix caches."""
-        batch_size = observation.state.shape[0]
-        if noise is None:
-            noise = self.sample_noise(
-                (batch_size, self.config.action_horizon, self.config.action_dim),
-                device,
-            )
-        if future_noise is None:
-            future_noise = self.sample_noise(
-                (
-                    batch_size,
-                    self.config.action_horizon,
-                    self.future_visuotactile_latent_dim,
-                ),
-                device,
-            )
-
-        images, image_masks, language_tokens, language_masks, state = self._preprocess_observation(
-            observation,
-            train=False,
-        )
-        prefix = self.embed_prefix(
-            images,
-            image_masks,
-            language_tokens,
-            language_masks,
-            observation=observation,
-        )
-        (
-            vl_prefix,
-            vl_pad_mask,
-            _,
-            tactile_prefix,
-            tactile_prefix_pad_mask,
-            _,
-        ) = prefix
-
-        # The action stream length is needed to preserve the same rotary
-        # positions used by the full non-cached training layout.
-        initial_time = torch.ones(batch_size, dtype=torch.float32, device=device)
-        initial_action_suffix = self.embed_action_suffix(state, noise, initial_time)
-        action_len = initial_action_suffix[1].shape[1]
-        past_key_values = self._build_prefix_cache(
-            vl_prefix,
-            vl_pad_mask,
-            tactile_prefix,
-            tactile_prefix_pad_mask,
-            action_len,
-        )
-        cached_prefix = (
-            (vl_pad_mask, tactile_prefix_pad_mask),
-            past_key_values,
-        )
-
-        actions = noise
-        future_latents = future_noise
-        dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
-        time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt / 2:
-            expanded_time = time.expand(batch_size)
-            action_velocity, visuotactile_velocity = self.denoise_step(
-                state,
-                cached_prefix,
-                actions,
-                future_latents,
-                expanded_time,
-            )
-            actions = actions + dt * action_velocity
-            future_latents = future_latents + dt * visuotactile_velocity
-            time += dt
-
-        if not return_future_visuotactile:
-            return actions
-        return {
-            "actions": actions,
-            "future_visuotactile": self.future_visuotactile_autoencoder.decode(future_latents),
-            "future_visuotactile_latents": future_latents,
-        }
-
 
 __all__ = [
     "IndependentTactileSiglipEncoder",
     "PI0ExpertVisuoTactilePytorch",
-    "PI0PrefixTactileExpertVisuoTactilePytorch",
 ]

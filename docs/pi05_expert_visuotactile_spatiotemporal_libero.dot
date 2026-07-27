@@ -1,0 +1,166 @@
+digraph PI05VisuoTactile {
+  graph [
+    rankdir=TB,
+    newrank=true,
+    bgcolor="#F8FAFC",
+    pad="0.30",
+    nodesep="0.35",
+    ranksep="0.55",
+    splines=ortho,
+    fontname="Noto Sans",
+    fontsize=20,
+    labelloc=t,
+    label="pi05_expert_visuotactile_spatiotemporal_libero\n真实张量流、三流 Transformer 与 future_attends_action"
+  ];
+  node [
+    shape=box,
+    style="rounded,filled",
+    color="#94A3B8",
+    fillcolor="#FFFFFF",
+    fontname="Noto Sans",
+    fontsize=10,
+    fontcolor="#0F172A",
+    margin="0.15,0.10"
+  ];
+  edge [
+    color="#64748B",
+    fontname="Noto Sans",
+    fontsize=8,
+    fontcolor="#334155",
+    arrowsize=0.65
+  ];
+
+  subgraph cluster_inputs {
+    label="① LIBERO 输入与 Flow Matching";
+    color="#CBD5E1";
+    fillcolor="#F1F5F9";
+    style="rounded,filled";
+
+    obs [label="当前观测 t\n头部相机 + 腕部相机\n224×224×3", fillcolor="#E0F2FE", color="#38BDF8"];
+    current_vt [label="current_visuotactile\n当前头部相机的副本\n[B, 224, 224, 3]", fillcolor="#CCFBF1", color="#2DD4BF"];
+    prompt [label="语言任务 prompt\n≤ 200 tokens", fillcolor="#E0F2FE", color="#38BDF8"];
+    actions [label="真实动作 a₀\n[B, 10, 32]", fillcolor="#FEF3C7", color="#F59E0B"];
+    future [label="严格未来头部帧 t+1…t+10\n[B, 10, 224, 224, 3]", fillcolor="#F3E8FF", color="#A855F7"];
+    flow [label="共享 τ ∈ (0,1)\n动作噪声 εₐ / latent 噪声 εᶻ", fillcolor="#FFE4E6", color="#FB7185"];
+    {rank=same; obs; current_vt; prompt; actions; future; flow;}
+  }
+
+  subgraph cluster_tokenizers {
+    label="② 三种 token 化路径";
+    color="#CBD5E1";
+    fillcolor="#FFFFFF";
+    style="rounded,filled";
+
+    prefix_path [
+      label="PREFIX 路径\nPaliGemma SigLIP（相机）\n+ 独立 Tactile SigLIP（current_visuotactile）\n+ Gemma language embedding\n→ [视觉 | 当前“触觉” | 语言] tokens",
+      fillcolor="#BAE6FD", color="#0284C7", penwidth=1.6
+    ];
+    action_path [
+      label="ACTION 路径\naτ = τ·εₐ + (1−τ)·a₀\nLinear 32→1024\n→ 10 action tokens\nτ→sinusoidal MLP→adaRMS 条件",
+      fillcolor="#FDE68A", color="#D97706", penwidth=1.6
+    ];
+    ae_encoder [
+      label="Future Conv-AE Encoder\n224² → 16×14×14\nz₀: [B,10,3136]\nflow target 分支 stop-gradient",
+      fillcolor="#F3E8FF", color="#9333EA"
+    ];
+    future_path [
+      label="FUTURE 路径\nzτ = τ·εᶻ + (1−τ)·z₀\n2×2 latent patchify: 14²→7²\n49 token/帧 × 10 = 490 tokens\n每 token 64 → Linear 64→1024\n+ learned time/row/col position\nτ→sinusoidal MLP→adaRMS 条件",
+      fillcolor="#E9D5FF", color="#9333EA", penwidth=1.6
+    ];
+    {rank=same; prefix_path; action_path; ae_encoder; future_path;}
+  }
+
+  transformer [
+    shape=plain,
+    label=<
+      <TABLE BORDER="1" CELLBORDER="1" CELLSPACING="0" CELLPADDING="8" COLOR="#475569">
+        <TR>
+          <TD COLSPAN="3" BGCOLOR="#E2E8F0">
+            <FONT POINT-SIZE="15"><B>③ 三流 Transformer Block × 18</B></FONT><BR/>
+            <FONT POINT-SIZE="9">各流参数独立；只把 Q/K/V 拼接后执行一次 masked attention</FONT>
+          </TD>
+        </TR>
+        <TR>
+          <TD PORT="pin" BGCOLOR="#E0F2FE"><B>Prefix / PaliGemma 2B</B><BR/>width 2048<BR/>独立 RMSNorm · QKV</TD>
+          <TD PORT="ain" BGCOLOR="#FEF3C7"><B>Action Expert 300M</B><BR/>width 1024<BR/>adaRMSNorm(τ) · 独立 QKV</TD>
+          <TD PORT="fin" BGCOLOR="#F3E8FF"><B>Future Expert 300M</B><BR/>width 1024<BR/>adaRMSNorm(τ) · 独立 QKV</TD>
+        </TR>
+        <TR>
+          <TD COLSPAN="3" BGCOLOR="#FFE4E6">
+            <B>concat Q/K/V → 共享 Masked Multi-Head Attention</B><BR/>
+            8 heads · 1 KV head · head dim 256
+          </TD>
+        </TR>
+        <TR>
+          <TD PORT="pout" BGCOLOR="#BAE6FD">split → 独立 O projection<BR/>residual · Norm · MLP 16384</TD>
+          <TD PORT="aout" BGCOLOR="#FDE68A">split → 独立 O projection<BR/>residual · adaRMS · MLP 4096</TD>
+          <TD PORT="fout" BGCOLOR="#E9D5FF">split → 独立 O projection<BR/>residual · adaRMS · MLP 4096</TD>
+        </TR>
+      </TABLE>
+    >
+  ];
+
+  attention [
+    shape=plain,
+    label=<
+      <TABLE BORDER="1" CELLBORDER="1" CELLSPACING="0" CELLPADDING="6" COLOR="#FB7185">
+        <TR><TD COLSPAN="4" BGCOLOR="#FFE4E6"><B>④ future_attends_action 可见性</B></TD></TR>
+        <TR><TD BGCOLOR="#FFF1F2"><B>Query ↓ / Key →</B></TD><TD BGCOLOR="#E0F2FE"><B>Prefix</B></TD><TD BGCOLOR="#FEF3C7"><B>Action</B></TD><TD BGCOLOR="#F3E8FF"><B>Future</B></TD></TR>
+        <TR><TD BGCOLOR="#E0F2FE"><B>Prefix</B></TD><TD BGCOLOR="#DCFCE7">✓</TD><TD BGCOLOR="#FEE2E2">✗</TD><TD BGCOLOR="#FEE2E2">✗</TD></TR>
+        <TR><TD BGCOLOR="#FEF3C7"><B>Action</B></TD><TD BGCOLOR="#DCFCE7">✓</TD><TD BGCOLOR="#DCFCE7">✓</TD><TD BGCOLOR="#FEE2E2">✗</TD></TR>
+        <TR><TD BGCOLOR="#F3E8FF"><B>Future</B></TD><TD BGCOLOR="#DCFCE7">✓</TD><TD BGCOLOR="#DCFCE7">✓</TD><TD BGCOLOR="#DCFCE7">✓</TD></TR>
+        <TR><TD COLSPAN="4" BGCOLOR="#FFF1F2"><FONT POINT-SIZE="9">Future 可读 Action；Action 不可读 Future，避免未来目标泄漏到策略。</FONT></TD></TR>
+      </TABLE>
+    >
+  ];
+  {rank=same; transformer; attention;}
+
+  subgraph cluster_outputs {
+    label="⑤ 输出头";
+    color="#CBD5E1";
+    fillcolor="#FFFFFF";
+    style="rounded,filled";
+
+    prefix_cache [label="Prefix 表征 / 推理时 KV cache", fillcolor="#E0F2FE", color="#0284C7"];
+    action_out [label="Linear 1024→32\n动作速度 vₐ [B,10,32]\nODE 10 步去噪 → actions", fillcolor="#FEF3C7", color="#D97706"];
+    future_out [label="Linear 1024→64 → unpatchify\nlatent 速度 vᶻ [B,10,3136]\nẑ₀ = zτ − τ·vᶻ", fillcolor="#E9D5FF", color="#9333EA"];
+    decoder [label="Future Conv-AE Decoder\n16×14×14 → 224²\n→ 预测未来 10 帧", fillcolor="#F3E8FF", color="#9333EA"];
+    {rank=same; prefix_cache; action_out; future_out; decoder;}
+  }
+
+  subgraph cluster_losses {
+    label="⑥ 训练阶段与损失";
+    color="#86EFAC";
+    fillcolor="#F0FDF4";
+    style="rounded,filled";
+
+    latent_phase [label="step 0–4999 · latent 阶段\n只训练独立 Tactile SigLIP\n+ Future Expert / projections / position / time MLP\n动作损失 = 0", fillcolor="#DCFCE7", color="#22C55E"];
+    joint_phase [label="step ≥ 5000 · joint 阶段\n全模型 + AE 联合微调\nL = 1.0·Laction + 0.05·Lfuture-flow\n+ 0.1·Lfuture-recon + 0.05·LAE-recon", fillcolor="#BBF7D0", color="#16A34A", penwidth=1.6];
+    recon_terms [label="复合图像重建项\n0.1 MSE + 1.0 Charbonnier + 0.2 SSIM\n+ 0.1 gradient + 0.1 pyramid + 0.5 temporal", fillcolor="#DCFCE7", color="#22C55E"];
+    note [label="LIBERO 没有真实触觉传感器：\n此配置把“当前头部相机副本”当 current_visuotactile，\n未来预测目标也是头部相机帧。\n另：state_input_mode=none，连续 state 未注入专家。", fillcolor="#ECFCCB", color="#65A30D"];
+    {rank=same; latent_phase; joint_phase; recon_terms; note;}
+  }
+
+  obs -> prefix_path;
+  current_vt -> prefix_path;
+  prompt -> prefix_path;
+  actions -> action_path;
+  flow -> action_path;
+  future -> ae_encoder;
+  ae_encoder -> future_path;
+  flow -> future_path;
+
+  prefix_path -> transformer:pin [color="#0284C7", penwidth=1.5];
+  action_path -> transformer:ain [color="#D97706", penwidth=1.5];
+  future_path -> transformer:fin [color="#9333EA", penwidth=1.5];
+
+  transformer:pout -> prefix_cache [color="#0284C7", penwidth=1.5];
+  transformer:aout -> action_out [color="#D97706", penwidth=1.5];
+  transformer:fout -> future_out [color="#9333EA", penwidth=1.5];
+  future_out -> decoder [color="#9333EA", penwidth=1.5];
+
+  action_out -> joint_phase [style=dashed, color="#16A34A"];
+  future_out -> joint_phase [style=dashed, color="#16A34A"];
+  decoder -> recon_terms [style=dashed, color="#16A34A"];
+  ae_encoder -> latent_phase [style=dashed, color="#16A34A"];
+}

@@ -18,7 +18,6 @@ import safetensors
 import torch
 
 from openpi.models_pytorch import pi0_pytorch
-from openpi.models_pytorch import pi0_visuotactile_pytorch
 from openpi.shared import image_tools
 import openpi.shared.array_typing as at
 
@@ -270,12 +269,14 @@ class BaseModelConfig(abc.ABC):
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
         if train_config.model.__class__.__name__ == "Pi0VisuoTactileConfig":
-            if train_config.model.use_separate_visuotactile_expert:
-                from openpi.models_pytorch import pi0_expertvisuotactile_pytorch
+            if not train_config.model.use_separate_visuotactile_expert:
+                raise ValueError(
+                    "Pi0VisuoTactileConfig now requires use_separate_visuotactile_expert=True; "
+                    "the legacy joint action/future model has been removed."
+                )
+            from openpi.models_pytorch import pi0_expertvisuotactile_pytorch
 
-                model = pi0_expertvisuotactile_pytorch.PI0ExpertVisuoTactilePytorch(config=train_config.model)
-            else:
-                model = pi0_visuotactile_pytorch.PI0VisuoTactilePytorch(config=train_config.model)
+            model = pi0_expertvisuotactile_pytorch.PI0ExpertVisuoTactilePytorch(config=train_config.model)
             safetensors.torch.load_model(model, weight_path, strict=False)
         else:
             model = pi0_pytorch.PI0Pytorch(config=train_config.model)

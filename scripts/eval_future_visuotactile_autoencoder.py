@@ -23,7 +23,7 @@ import torch
 import tyro
 
 from openpi.models import pi0_config
-from openpi.models_pytorch import pi0_visuotactile_pytorch as _visuotactile
+from openpi.models_pytorch import future_visuotactile_autoencoder as _autoencoder
 from openpi.training import config as _config
 from openpi.training import data_loader as _data
 
@@ -31,7 +31,7 @@ from openpi.training import data_loader as _data
 @dataclasses.dataclass
 class Args:
     checkpoint_dir: pathlib.Path
-    config_name: str = "pi05_visuotactile_libero"
+    config_name: str = "pi05_expert_visuotactile_spatiotemporal_libero"
     output_dir: pathlib.Path = pathlib.Path("data/libero/autoencoder_reconstruction")
     num_samples: int = 32
     batch_size: int = 32
@@ -80,7 +80,7 @@ def _to_uint8(images: torch.Tensor) -> np.ndarray:
 
 
 def _metric_rows(prediction: torch.Tensor, target: torch.Tensor) -> list[dict[str, float | int]]:
-    terms = _visuotactile._reconstruction_loss_terms(prediction, target)  # noqa: SLF001
+    terms = _autoencoder.reconstruction_loss_terms(prediction, target)
     mse_normalized = terms["mse"].flatten()
     mse_01 = mse_normalized / 4.0
     mae_01 = (prediction.float() - target.float()).abs().flatten(2).mean(2).flatten() / 2.0
@@ -157,7 +157,7 @@ def main(args: Args) -> None:
         shuffle=True,
         num_batches=math.ceil(args.num_samples / config.batch_size),
     )
-    model = _visuotactile.create_future_visuotactile_autoencoder(config.model).to(device)
+    model = _autoencoder.create_future_visuotactile_autoencoder(config.model).to(device)
     weight_path = args.checkpoint_dir / "autoencoder.safetensors"
     safetensors.torch.load_model(model, weight_path, device=str(device))
     model.eval()

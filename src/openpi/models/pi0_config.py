@@ -124,9 +124,6 @@ class Pi0VisuoTactileConfig(Pi0Config):
     # Use a third Gemma stream dedicated to future latent prediction instead
     # of concatenating future latents into the action expert.
     use_separate_visuotactile_expert: bool = False
-    # Route the current tactile prefix through the tactile Gemma expert,
-    # isolated from the VL prefix.
-    use_prefix_tactile_expert: bool = False
     # Deprecated compatibility flag. The separate-expert PyTorch model always
     # uses an independent tactile SigLIP encoder.
     use_separate_tactile_encoder: bool = False
