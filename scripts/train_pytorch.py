@@ -180,6 +180,10 @@ def build_optimizer_param_groups(model, model_cfg, peak_lr):
         "future_autoencoder": [],
     }
     for name, parameter in core_model.named_parameters():
+        # Permanently frozen modules (for example, a fixed future-image codec)
+        # should not occupy an optimizer group or acquire Adam state.
+        if not parameter.requires_grad:
+            continue
         if name.startswith("future_visuotactile_autoencoder."):
             groups["future_autoencoder"].append(parameter)
         elif model_cfg.use_separate_tactile_encoder and name.startswith("tactile_encoder."):
@@ -190,6 +194,9 @@ def build_optimizer_param_groups(model, model_cfg, peak_lr):
                 "visuotactile_in_proj.",
                 "visuotactile_out_proj.",
                 "visuotactile_time_mlp_",
+                "visuotactile_temporal_position_embedding.",
+                "visuotactile_row_position_embedding.",
+                "visuotactile_column_position_embedding.",
                 "tactile_prefix_proj.",
             )
         ):

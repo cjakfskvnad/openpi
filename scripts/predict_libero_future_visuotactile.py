@@ -121,7 +121,10 @@ def _load_model_and_transforms(args: Args, device: str):
     norm_stats = checkpoints.load_norm_stats(args.checkpoint_dir / "assets", data_config.asset_id)
     input_transform = transforms.compose(
         [
-            libero_policy.LiberoVisuoTactileInputs(model_type=train_config.model.model_type),
+            libero_policy.LiberoVisuoTactileInputs(
+                model_type=train_config.model.model_type,
+                include_current_visuotactile=train_config.model.use_separate_tactile_encoder,
+            ),
             transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ]

@@ -566,6 +566,91 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+def _make_pi05_expert_visuotactile_attention_libero_config(
+    *,
+    name: str,
+    attention_mode: str,
+    use_spatiotemporal_future_tokens: bool = False,
+    freeze_future_autoencoder: bool = True,
+    future_joint_autoencoder_loss_weight: float = 0.0,
+    future_temporal_loss_weight: float = 2.0,
+) -> TrainConfig:
+    """Build an action-conditioned future-video ablation without changing the baseline config."""
+    return TrainConfig(
+        name=name,
+        model=pi0_config.Pi0VisuoTactileConfig(
+            pi05=True,
+            use_separate_visuotactile_expert=True,
+            use_separate_tactile_encoder=True,
+            action_visuotactile_attention_mode=attention_mode,
+            use_spatiotemporal_future_tokens=use_spatiotemporal_future_tokens,
+            future_visuotactile_token_patch_size=2,
+            action_dim=32,
+            action_horizon=10,
+            discrete_state_input=False,
+            future_visuotactile_shape=(224, 224, 3),
+            future_visuotactile_latent_dim=16,
+            future_visuotactile_latent_grid_size=(14, 14),
+            future_visuotactile_encoder_width=64,
+            future_visuotactile_decoder_width=256,
+            future_visuotactile_decoder_depth=2,
+            future_joint_finetune_start_step=5_000,
+            future_joint_flow_loss_weight=0.05,
+            future_joint_visuotactile_loss_weight=0.1,
+            future_joint_autoencoder_loss_weight=future_joint_autoencoder_loss_weight,
+            freeze_future_autoencoder=freeze_future_autoencoder,
+            future_temporal_loss_weight=future_temporal_loss_weight,
+            future_head_lr_multiplier=2.0,
+            future_backbone_lr_multiplier=0.25,
+        ),
+        data=SimpleDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(assets_dir="assets/pi05_libero"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[
+                    libero_policy.LiberoVisuoTactileInputs(
+                        model_type=model.model_type,
+                        include_current_visuotactile=model.use_separate_tactile_encoder,
+                    )
+                ],
+                outputs=[libero_policy.LiberoOutputs()],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("actions", "image"),
+                action_sequence_extra_steps={"image": 1},
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image": "image",
+                                "observation/wrist_image": "wrist_image",
+                                "observation/state": "state",
+                                "actions": "actions",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+            ),
+        ),
+        pytorch_weight_path="checkpoints/pytorch/pi05_base",
+        pytorch_autoencoder_weight_path=(
+            "checkpoints/future_visuotactile_autoencoder/libero_headcam_singleframe_ae/7000"
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        num_train_steps=30_000,
+        save_interval=5_000,
+        wandb_enabled=True,
+    )
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -1139,6 +1224,34 @@ _CONFIGS = [
         ),
         num_train_steps=30_000,
         wandb_enabled=True,
+    ),
+    _make_pi05_expert_visuotactile_attention_libero_config(
+        name="pi05_expert_visuotactile_future_attends_action_libero",
+        attention_mode="future_attends_action",
+    ),
+    _make_pi05_expert_visuotactile_attention_libero_config(
+        name="pi05_expert_visuotactile_action_future_bidirectional_libero",
+        attention_mode="bidirectional",
+    ),
+    _make_pi05_expert_visuotactile_attention_libero_config(
+        name="pi05_expert_visuotactile_spatiotemporal_libero",
+        attention_mode="future_attends_action",
+        use_spatiotemporal_future_tokens=True,
+        # Keep the latent target stable during the first 5k future-only steps,
+        # then update both AE encoder and decoder during joint fine-tuning.
+        freeze_future_autoencoder=False,
+        future_joint_autoencoder_loss_weight=0.05,
+        # Retain explicit motion supervision without letting it dominate the
+        # single-frame appearance and sharpness objectives.
+        future_temporal_loss_weight=0.5,
+    ),
+    _make_pi05_expert_visuotactile_attention_libero_config(
+        name="pi05_expert_visuotactile_spatiotemporal_bidirectional_libero",
+        attention_mode="bidirectional",
+        use_spatiotemporal_future_tokens=True,
+        freeze_future_autoencoder=False,
+        future_joint_autoencoder_loss_weight=0.05,
+        future_temporal_loss_weight=0.5,
     ),
     TrainConfig(
         name="pi05_expert_visuotactile_state_adarms_fullft_libero",

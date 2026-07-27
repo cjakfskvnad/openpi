@@ -466,3 +466,48 @@ We will collect common issues and their solutions here. If you encounter an issu
     --num-train-steps 30000 \
     --model.future-joint-finetune-start-step 0 \
     --save-interval 5000
+
+
+      cd /home/user/kunlun/muze/openpi
+
+  CUDA_VISIBLE_DEVICES=3 \
+  TORCHDYNAMO_DISABLE=1 \
+  .venv/bin/python -u scripts/serve_policy.py \
+    --env LIBERO \
+    --port 8013 \
+    policy:checkpoint \
+    --policy.config=pi05_expert_visuotactile_libero \
+    --policy.dir=/home/user/kunlun/muze/openpi/checkpoints/pi05_expert_visuotactile_libero/libero_fullft_lr_fixed/25000
+
+
+      cd /home/user/kunlun/muze/openpi
+  source examples/libero/.venv/bin/activate
+  export PYTHONPATH="$PWD/third_party/libero:${PYTHONPATH:-}"
+  export CUDA_VISIBLE_DEVICES=4
+
+  MUJOCO_GL=egl python examples/libero/main.py \
+    --args.host 127.0.0.1 \
+    --args.port 8013 \
+    --args.task-suite-name libero_spatial \
+    --args.num-trials-per-task 50 \
+    --args.num-parallel-envs 10 \
+    --args.no-save-video
+
+      CUDA_VISIBLE_DEVICES=6 PYTHONPATH=src uv run torchrun \
+    --standalone --nnodes=1 --nproc-per-node=1 \
+    scripts/train_pytorch.py \
+    pi05_expert_visuotactile_action_future_bidirectional_libero \
+    --exp-name libero_action_future_bidirectional_motion2_frozen_ae_b8_30k
+
+
+      cd /home/user/kunlun/muze/openpi
+
+  CUDA_VISIBLE_DEVICES=1 \
+  PYTHONPATH=src \
+  uv run torchrun \
+    --standalone \
+    --nnodes=1 \
+    --nproc-per-node=1 \
+    scripts/train_pytorch.py \
+    pi05_expert_visuotactile_spatiotemporal_bidirectional_libero \
+    --exp-name libero_spatiotemporal_bidirectional_ae_ft_temporal05_b8_30k

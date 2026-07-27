@@ -57,6 +57,11 @@ coverage.xml
 .pytest_cache/
 cover/
 
+# Local experimental tests
+/scripts/train_pytorch_test.py
+/src/openpi/models_pytorch/pi0_expertvisuotactile_pytorch_test.py
+/src/openpi/models_pytorch/pi0_visuotactile_pytorch_test.py
+
 # Translations
 *.mo
 *.pot

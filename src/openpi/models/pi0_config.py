@@ -134,6 +134,11 @@ class Pi0VisuoTactileConfig(Pi0Config):
     # pi0.5's original behavior; "adarms" injects an encoded state through
     # the action expert's adaptive RMSNorm layers.
     state_input_mode: str = "none"
+    # Cross-attention between the action and future visuo-tactile suffixes.
+    # "isolated" preserves the original two-way isolation,
+    # "future_attends_action" lets future queries read action keys only, and
+    # "bidirectional" enables both cross-stream directions.
+    action_visuotactile_attention_mode: str = "isolated"
     visuotactile_expert_variant: _gemma.Variant = "gemma_300m"
     visuotactile_keys: tuple[str, ...] = ("visuotactile_0_rgb", "tactile_0_rgb")
     future_visuotactile_key: str = "future_visuotactile"
@@ -148,6 +153,11 @@ class Pi0VisuoTactileConfig(Pi0Config):
     future_visuotactile_decoder_num_heads: int = 8
     future_visuotactile_patch_size: int = 16
     future_visuotactile_encoder_chunk_size: int = 8
+    # Preserve the latent grid as spatiotemporal tokens instead of flattening
+    # each complete future frame into one token. A token contains one
+    # token_patch_size x token_patch_size patch of the latent grid.
+    use_spatiotemporal_future_tokens: bool = False
+    future_visuotactile_token_patch_size: int = 2
     action_loss_weight: float = 1.0
     future_flow_loss_weight: float = 1.0
     future_visuotactile_loss_weight: float = 1.0
@@ -163,6 +173,10 @@ class Pi0VisuoTactileConfig(Pi0Config):
     future_gradient_loss_weight: float = 0.1
     future_pyramid_loss_weight: float = 0.1
     future_temporal_loss_weight: float = 0.2
+    # Keep the pretrained future-image codec fixed during every training
+    # phase. Reconstruction gradients can still pass through its decoder to
+    # the future expert while codec parameters remain frozen.
+    freeze_future_autoencoder: bool = False
 
     # Staged expert PyTorch training: tactile-only flow matching before this
     # boundary, then full-model joint action and future prediction training.
@@ -174,7 +188,30 @@ class Pi0VisuoTactileConfig(Pi0Config):
     def __post_init__(self):
         super().__post_init__()
         if self.state_input_mode not in {"none", "adarms"}:
+            raise ValueError(f"state_input_mode must be one of {{'none', 'adarms'}}, got {self.state_input_mode!r}.")
+        valid_attention_modes = {
+            "isolated",
+            "future_attends_action",
+            "bidirectional",
+        }
+        if self.action_visuotactile_attention_mode not in valid_attention_modes:
             raise ValueError(
-                "state_input_mode must be one of {'none', 'adarms'}, "
-                f"got {self.state_input_mode!r}."
+                "action_visuotactile_attention_mode must be one of "
+                f"{sorted(valid_attention_modes)}, "
+                f"got {self.action_visuotactile_attention_mode!r}."
             )
+        if self.future_visuotactile_token_patch_size <= 0:
+            raise ValueError(
+                "future_visuotactile_token_patch_size must be positive, "
+                f"got {self.future_visuotactile_token_patch_size}."
+            )
+        if self.use_spatiotemporal_future_tokens:
+            grid_height, grid_width = self.future_visuotactile_latent_grid_size
+            patch_size = self.future_visuotactile_token_patch_size
+            if grid_height % patch_size or grid_width % patch_size:
+                raise ValueError(
+                    "future_visuotactile_latent_grid_size must be divisible by "
+                    "future_visuotactile_token_patch_size when spatiotemporal "
+                    f"tokens are enabled; got grid {(grid_height, grid_width)} "
+                    f"and patch size {patch_size}."
+                )
